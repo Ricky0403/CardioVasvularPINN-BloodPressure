@@ -1,96 +1,57 @@
 import torch
 
-def get_physics_loss(model, inputs):
+def get_physics_loss(prediction, x, viscosity):
     """
     Calculates the Navier-Stokes Residuals (The Physics Error).
     If the output is 0, the physics is perfect.
     """
     
-    # 1. Enable Gradients for the Input
-    # We need to track how x,y,z,t change to calculate derivatives
-    inputs.requires_grad = True
-    
-    # 2. Get Predictions from the Model
-    predictions = model(inputs)
-    
-    # Split predictions into u, v, w, p
-    # predictions[:, 0:1] means get column 0 but keep it as a column
-    u = predictions[:, 0:1]
-    v = predictions[:, 1:2]
-    w = predictions[:, 2:3]
-    p = predictions[:, 3:4]
-    
-    # 3. CALCULATE DERIVATIVES (The Hard Part)
-    # We use torch.autograd.grad to find gradients
-    
-    def get_grad(output_var, input_var):
-        return torch.autograd.grad(
-            output_var, input_var, 
-            grad_outputs=torch.ones_like(output_var), 
-            create_graph=True, # Essential for training
-            retain_graph=True
-        )[0]
+    # 1. Unpack existing predictions
+    # prediction shape is (N, 4) -> u, v, w, p
+    u = prediction[:, 0:1]
+    v = prediction[:, 1:2]
+    w = prediction[:, 2:3]
+    p = prediction[:, 3:4]
 
-    # Gradients of Velocity (u)
-    du_dinput = get_grad(u, inputs)
-    u_x = du_dinput[:, 0:1]
-    u_y = du_dinput[:, 1:2]
-    u_z = du_dinput[:, 2:3]
-    u_t = du_dinput[:, 3:4]
-    
-    # Gradients of Velocity (v)
-    dv_dinput = get_grad(v, inputs)
-    v_x = dv_dinput[:, 0:1]
-    v_y = dv_dinput[:, 1:2]
-    v_z = dv_dinput[:, 2:3]
-    v_t = dv_dinput[:, 3:4]
-    
-    # Gradients of Velocity (w)
-    dw_dinput = get_grad(w, inputs)
-    w_x = dw_dinput[:, 0:1]
-    w_y = dw_dinput[:, 1:2]
-    w_z = dw_dinput[:, 2:3]
-    w_t = dw_dinput[:, 3:4]
-    
-    # Gradients of Pressure (p)
-    dp_dinput = get_grad(p, inputs)
-    p_x = dp_dinput[:, 0:1]
-    p_y = dp_dinput[:, 1:2]
-    p_z = dp_dinput[:, 2:3]
+    # 2. Calculate First Derivatives (gradients)
+    # We use create_graph=True so we can take the derivative of this derivative later (for viscosity)
+    u_g = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+    v_g = torch.autograd.grad(v, x, grad_outputs=torch.ones_like(v), create_graph=True)[0]
+    w_g = torch.autograd.grad(w, x, grad_outputs=torch.ones_like(w), create_graph=True)[0]
+    p_g = torch.autograd.grad(p, x, grad_outputs=torch.ones_like(p), create_graph=True)[0]
 
-    # Second Derivatives (Laplacian) for Viscosity term
-    # u_xx + u_yy + u_zz
-    u_xx = get_grad(u_x, inputs)[:, 0:1]
-    u_yy = get_grad(u_y, inputs)[:, 1:2]
-    u_zz = get_grad(u_z, inputs)[:, 2:3]
+    # Unpack gradients: [du/dx, du/dy, du/dz, du/dt]
+    u_x, u_y, u_z, u_t = u_g[:, 0:1], u_g[:, 1:2], u_g[:, 2:3], u_g[:, 3:4]
+    v_x, v_y, v_z, v_t = v_g[:, 0:1], v_g[:, 1:2], v_g[:, 2:3], v_g[:, 3:4]
+    w_x, w_y, w_z, w_t = w_g[:, 0:1], w_g[:, 1:2], w_g[:, 2:3], w_g[:, 3:4]
     
-    v_xx = get_grad(v_x, inputs)[:, 0:1]
-    v_yy = get_grad(v_y, inputs)[:, 1:2]
-    v_zz = get_grad(v_z, inputs)[:, 2:3]
-    
-    w_xx = get_grad(w_x, inputs)[:, 0:1]
-    w_yy = get_grad(w_y, inputs)[:, 1:2]
-    w_zz = get_grad(w_z, inputs)[:, 2:3]
+    p_x, p_y, p_z = p_g[:, 0:1], p_g[:, 1:2], p_g[:, 2:3]
 
-    # 4. NAVIER-STOKES EQUATIONS
-    # Momentum Equation in X, Y, Z directions
-    
-    # Read the Viscosity from the model (It learns this!)
-    mu = model.viscosity
+    # 3. Calculate Second Derivatives (Viscosity term)
+    # Laplacian u (u_xx + u_yy + u_zz)
+    u_xx = torch.autograd.grad(u_x, x, grad_outputs=torch.ones_like(u_x), create_graph=True)[0][:, 0:1]
+    u_yy = torch.autograd.grad(u_y, x, grad_outputs=torch.ones_like(u_y), create_graph=True)[0][:, 1:2]
+    u_zz = torch.autograd.grad(u_z, x, grad_outputs=torch.ones_like(u_z), create_graph=True)[0][:, 2:3]
 
-    # X-Momentum Residual
-    f_u = u_t + (u*u_x + v*u_y + w*u_z) + p_x - mu*(u_xx + u_yy + u_zz)
-    
-    # Y-Momentum Residual
-    f_v = v_t + (u*v_x + v*v_y + w*v_z) + p_y - mu*(v_xx + v_yy + v_zz)
-    
-    # Z-Momentum Residual
-    f_w = w_t + (u*w_x + v*w_y + w*w_z) + p_z - mu*(w_xx + w_yy + w_zz)
+    v_xx = torch.autograd.grad(v_x, x, grad_outputs=torch.ones_like(v_x), create_graph=True)[0][:, 0:1]
+    v_yy = torch.autograd.grad(v_y, x, grad_outputs=torch.ones_like(v_y), create_graph=True)[0][:, 1:2]
+    v_zz = torch.autograd.grad(v_z, x, grad_outputs=torch.ones_like(v_z), create_graph=True)[0][:, 2:3]
 
-    # Continuity Equation (Conservation of Mass: In = Out)
-    f_mass = u_x + v_y + w_z
+    w_xx = torch.autograd.grad(w_x, x, grad_outputs=torch.ones_like(w_x), create_graph=True)[0][:, 0:1]
+    w_yy = torch.autograd.grad(w_y, x, grad_outputs=torch.ones_like(w_y), create_graph=True)[0][:, 1:2]
+    w_zz = torch.autograd.grad(w_z, x, grad_outputs=torch.ones_like(w_z), create_graph=True)[0][:, 2:3]
 
-    # 5. Combine Errors (Mean Squared Error)
-    loss_f = torch.mean(f_u**2) + torch.mean(f_v**2) + torch.mean(f_w**2) + torch.mean(f_mass**2)
+    # 4. Navier-Stokes Equations (Incompressible)
+    # Momentum u
+    f_u = u_t + (u*u_x + v*u_y + w*u_z) + p_x - viscosity * (u_xx + u_yy + u_zz)
+    # Momentum v
+    f_v = v_t + (u*v_x + v*v_y + w*v_z) + p_y - viscosity * (v_xx + v_yy + v_zz)
+    # Momentum w
+    f_w = w_t + (u*w_x + v*w_y + w*w_z) + p_z - viscosity * (w_xx + w_yy + w_zz)
+    # Continuity (Mass conservation)
+    f_c = u_x + v_y + w_z
+
+    # 5. Return Total Physics Loss
+    loss_f = torch.mean(f_u**2) + torch.mean(f_v**2) + torch.mean(f_w**2) + torch.mean(f_c**2)
     
     return loss_f

@@ -51,7 +51,6 @@ dataset = TensorDataset(X, U, P)
 train_loader = DataLoader(dataset, batch_size=Batch_Size, shuffle=True)
 
 model = PINN(layers=[4, 64, 64, 64, 64, 64, 64, 64, 4], activation=nn.Tanh()).to(device)
-#model = torch.compile(model) # Uncomment this for linux with PyTorch 2.0+
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
 print("Starting Training")
@@ -63,15 +62,16 @@ for epoch in range(Epoches):
     phys_loss_accum = 0
 
     for batch_idx, (x_batch, u_batch, p_batch) in enumerate(train_loader):
+        x_batch = x_batch.clone().detach().requires_grad_(True)
 
         optimizer.zero_grad()
-            
+
         prediction = model(x_batch)
         u_pred = prediction[:, 0:3] 
             
         loss_data = torch.mean((u_pred - u_batch)**2)
             
-        loss_physics = get_physics_loss(model, x_batch)
+        loss_physics = get_physics_loss(prediction, x_batch, model.viscosity)
             
         loss = loss_data + loss_physics
             
