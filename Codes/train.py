@@ -27,7 +27,7 @@ def calculate_metrics(prediction, target):
     return mse.item(), accuracy
 
 Total_Duration = 1.0
-Batch_Size = 10000
+Batch_Size = 15000
 Epoches = 5000
 LEARNING_RATE = 1e-3       
 SAVE_PATH = "../Models/pinn_model_tanh.pth"
@@ -50,7 +50,7 @@ P = P.to(device)
 dataset = TensorDataset(X, U, P)
 train_loader = DataLoader(dataset, batch_size=Batch_Size, shuffle=True)
 
-model = PINN(layers=[4, 64, 64, 64, 64, 64, 64, 64, 4], activation=nn.Tanh()).to(device)
+model = PINN(layers=[4, 64, 64, 64, 64, 64, 64, 64, 4], activation=nn.SiLU()).to(device)
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
 print("Starting Training")
@@ -73,7 +73,7 @@ for epoch in range(Epoches):
             
         loss_physics = get_physics_loss(prediction, x_batch, model.viscosity)
             
-        loss = loss_data + loss_physics
+        loss = loss_data*100.0 + loss_physics
             
         loss.backward()
         optimizer.step()
