@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+import torch.nn.functional as F
 import time
 
 # Import your custom modules
@@ -14,7 +15,7 @@ torch.set_float32_matmul_precision('high')
 def calculate_metrics(prediction, target):
     with torch.no_grad():
         # 1. MSE Loss
-        mse = torch.mean((prediction - target)**2)
+        mse = F.mse_loss(prediction, target)
         
         # 2. Relative L2 Accuracy
         error_norm = torch.norm(prediction - target)
@@ -53,6 +54,8 @@ train_loader = DataLoader(dataset, batch_size=Batch_Size, shuffle=True)
 model = PINN(layers=[4, 64, 64, 64, 64, 64, 64, 64, 4], activation=nn.SiLU()).to(device)
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
+ones_wrapper = torch.ones((Batch_Size, 1), device=device, requires_grad=False)
+
 print("Starting Training")
 start_time = time.time()
 running_time = start_time
@@ -69,9 +72,9 @@ for epoch in range(Epoches):
         prediction = model(x_batch)
         u_pred = prediction[:, 0:3] 
             
-        loss_data = torch.mean((u_pred - u_batch)**2)
+        loss_data = F.mse_loss(u_pred, u_batch)
             
-        loss_physics = get_physics_loss(prediction, x_batch, model.viscosity)
+        loss_physics = get_physics_loss(prediction, x_batch, model.viscosity, ones_wrapper)
             
         loss = loss_data*100.0 + loss_physics
             

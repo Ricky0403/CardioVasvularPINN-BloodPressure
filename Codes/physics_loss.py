@@ -1,6 +1,6 @@
 import torch
 
-def get_physics_loss(prediction, x, viscosity):
+def get_physics_loss(prediction, x, viscosity, ones_tensor):
     """
     Calculates the Navier-Stokes Residuals (The Physics Error).
     If the output is 0, the physics is perfect.
@@ -13,12 +13,14 @@ def get_physics_loss(prediction, x, viscosity):
     w = prediction[:, 2:3]
     p = prediction[:, 3:4]
 
+    current_batch_size = x.shape[0]
+    ones_tensor = ones_tensor[:current_batch_size]
     # 2. Calculate First Derivatives (gradients)
     # We use create_graph=True so we can take the derivative of this derivative later (for viscosity)
-    u_g = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True)[0]
-    v_g = torch.autograd.grad(v, x, grad_outputs=torch.ones_like(v), create_graph=True)[0]
-    w_g = torch.autograd.grad(w, x, grad_outputs=torch.ones_like(w), create_graph=True)[0]
-    p_g = torch.autograd.grad(p, x, grad_outputs=torch.ones_like(p), create_graph=True)[0]
+    u_g = torch.autograd.grad(u, x, grad_outputs=ones_tensor, create_graph=True)[0]
+    v_g = torch.autograd.grad(v, x, grad_outputs=ones_tensor, create_graph=True)[0]
+    w_g = torch.autograd.grad(w, x, grad_outputs=ones_tensor, create_graph=True)[0]
+    p_g = torch.autograd.grad(p, x, grad_outputs=ones_tensor, create_graph=True)[0]
 
     # Unpack gradients: [du/dx, du/dy, du/dz, du/dt]
     u_x, u_y, u_z, u_t = u_g[:, 0:1], u_g[:, 1:2], u_g[:, 2:3], u_g[:, 3:4]
@@ -29,17 +31,17 @@ def get_physics_loss(prediction, x, viscosity):
 
     # 3. Calculate Second Derivatives (Viscosity term)
     # Laplacian u (u_xx + u_yy + u_zz)
-    u_xx = torch.autograd.grad(u_x, x, grad_outputs=torch.ones_like(u_x), create_graph=True)[0][:, 0:1]
-    u_yy = torch.autograd.grad(u_y, x, grad_outputs=torch.ones_like(u_y), create_graph=True)[0][:, 1:2]
-    u_zz = torch.autograd.grad(u_z, x, grad_outputs=torch.ones_like(u_z), create_graph=True)[0][:, 2:3]
+    u_xx = torch.autograd.grad(u_x, x, grad_outputs=ones_tensor, create_graph=True)[0][:, 0:1]
+    u_yy = torch.autograd.grad(u_y, x, grad_outputs=ones_tensor, create_graph=True)[0][:, 1:2]
+    u_zz = torch.autograd.grad(u_z, x, grad_outputs=ones_tensor, create_graph=True)[0][:, 2:3]
 
-    v_xx = torch.autograd.grad(v_x, x, grad_outputs=torch.ones_like(v_x), create_graph=True)[0][:, 0:1]
-    v_yy = torch.autograd.grad(v_y, x, grad_outputs=torch.ones_like(v_y), create_graph=True)[0][:, 1:2]
-    v_zz = torch.autograd.grad(v_z, x, grad_outputs=torch.ones_like(v_z), create_graph=True)[0][:, 2:3]
+    v_xx = torch.autograd.grad(v_x, x, grad_outputs=ones_tensor, create_graph=True)[0][:, 0:1]
+    v_yy = torch.autograd.grad(v_y, x, grad_outputs=ones_tensor, create_graph=True)[0][:, 1:2]
+    v_zz = torch.autograd.grad(v_z, x, grad_outputs=ones_tensor, create_graph=True)[0][:, 2:3]
 
-    w_xx = torch.autograd.grad(w_x, x, grad_outputs=torch.ones_like(w_x), create_graph=True)[0][:, 0:1]
-    w_yy = torch.autograd.grad(w_y, x, grad_outputs=torch.ones_like(w_y), create_graph=True)[0][:, 1:2]
-    w_zz = torch.autograd.grad(w_z, x, grad_outputs=torch.ones_like(w_z), create_graph=True)[0][:, 2:3]
+    w_xx = torch.autograd.grad(w_x, x, grad_outputs=ones_tensor, create_graph=True)[0][:, 0:1]
+    w_yy = torch.autograd.grad(w_y, x, grad_outputs=ones_tensor, create_graph=True)[0][:, 1:2]
+    w_zz = torch.autograd.grad(w_z, x, grad_outputs=ones_tensor, create_graph=True)[0][:, 2:3]
 
     # 4. Navier-Stokes Equations (Incompressible)
     # Momentum u
