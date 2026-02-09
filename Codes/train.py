@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -5,7 +6,8 @@ from torch.utils.data import DataLoader, TensorDataset
 import torch.nn.functional as F
 import time
 
-# Import your custom modules
+# Import custom modules
+from normalizer import MinMaxNormalizer
 from data_loader import DataLoader as PINN_DataLoader
 from model import PINNModel as PINN
 from physics_loss import get_physics_loss
@@ -31,7 +33,9 @@ Total_Duration = 1.0
 Batch_Size = 15000
 Epoches = 5000
 LEARNING_RATE = 1e-3       
-SAVE_PATH = "../Models/pinn_model_tanh.pth"
+save_dir = "../Models"
+SAVE_PATH = os.path.join(save_dir, "pinn_model_tanh.pth")
+os.makedirs(save_dir, exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -44,11 +48,38 @@ dt = Total_Duration / num_files
 
 X, U, P = raw_loader.load(time_step=dt)
 
-X = X.to(device)
-U = U.to(device)
-P = P.to(device)
+spatial_normalizer = MinMaxNormalizer(X, method='column-wise', device=device)
+velocity_normalizer = MinMaxNormalizer(U, method='global', device=device)
+pressure_normalizer = MinMaxNormalizer(P, method='global', device=device)
 
-dataset = TensorDataset(X, U, P)
+X_norm = spatial_normalizer.encode(X)
+U_norm = velocity_normalizer.encode(U)
+P_norm = pressure_normalizer.encode(P)
+
+X_norm = X_norm.to(device)
+U_norm = U_norm.to(device)
+P_norm = P_norm.to(device)
+
+scales = {
+    'x': (spatial_normalizer.max[0] - spatial_normalizer.min[0]) / 2.0,
+    'y': (spatial_normalizer.max[1] - spatial_normalizer.min[1]) / 2.0,
+    'z': (spatial_normalizer.max[2] - spatial_normalizer.min[2]) / 2.0,
+    't': (spatial_normalizer.max[3] - spatial_normalizer.min[3]) / 2.0,
+
+    'u': (velocity_normalizer.max - velocity_normalizer.min) / 2.0,
+    'v': (velocity_normalizer.max - velocity_normalizer.min) / 2.0,
+    'w': (velocity_normalizer.max - velocity_normalizer.min) / 2.0,
+
+    'p': (pressure_normalizer.max - pressure_normalizer.min) / 2.0
+}
+
+for key in scales:
+    if isinstance(scales[key], torch.Tensor):
+        scales[key] = scales[key].to(device)
+    else:
+        scales[key] = torch.tensor(scales[key]).to(device)
+
+dataset = TensorDataset(X_norm, U_norm, P_norm)
 train_loader = DataLoader(dataset, batch_size=Batch_Size, shuffle=True)
 
 model = PINN(layers=[4, 64, 64, 64, 64, 64, 64, 64, 4], activation=nn.SiLU()).to(device)
@@ -71,10 +102,10 @@ for epoch in range(Epoches):
 
         prediction = model(x_batch)
         u_pred = prediction[:, 0:3] 
-            
+
         loss_data = F.mse_loss(u_pred, u_batch)
             
-        loss_physics = get_physics_loss(prediction, x_batch, model.viscosity, ones_wrapper)
+        loss_physics = get_physics_loss(prediction, x_batch, model.viscosity, ones_wrapper, scales=scales)
             
         loss = loss_data*100.0 + loss_physics
             
@@ -90,15 +121,15 @@ for epoch in range(Epoches):
         
         # Run a full forward pass on ALL data to check accuracy
         with torch.no_grad():
-            full_pred = model(X)
+            full_pred = model(X_norm)
             u_full_pred = full_pred[:, 0:3] # Predicted Velocity
             p_full_pred = full_pred[:, 3:4] # Predicted Pressure
             
             # --- A. Training Accuracy (Velocity) ---
-            _, train_acc = calculate_metrics(u_full_pred, U)
+            _, train_acc = calculate_metrics(u_full_pred, U_norm)
             
             # --- B. Validation Accuracy (Pressure) ---
-            val_loss, val_acc = calculate_metrics(p_full_pred, P)
+            val_loss, val_acc = calculate_metrics(p_full_pred, P_norm)
         
         current_mu = model.viscosity.item()
         
