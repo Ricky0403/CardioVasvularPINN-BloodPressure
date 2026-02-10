@@ -105,7 +105,7 @@ for epoch in range(Epoches):
 
         loss_data = F.mse_loss(u_pred, u_batch)
             
-        loss_physics = get_physics_loss(prediction, x_batch, model.viscosity, ones_wrapper, scales=scales)
+        loss_physics = get_physics_loss(prediction, x_batch, F.softplus(model.viscosity), ones_wrapper, scales=scales)
             
         loss = loss_data*100.0 + loss_physics
             
@@ -131,7 +131,7 @@ for epoch in range(Epoches):
             # --- B. Validation Accuracy (Pressure) ---
             val_loss, val_acc = calculate_metrics(p_full_pred, P_norm)
         
-        current_mu = model.viscosity.item()
+        current_mu = F.softplus(model.viscosity).item()
         
         # Averages for printing
         avg_total = total_loss / len(train_loader)

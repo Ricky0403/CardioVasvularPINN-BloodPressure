@@ -17,7 +17,7 @@ class PINNModel(nn.Module):
         #Output layer
         self.output_layer = nn.Linear(layers[-2], layers[-1])
         #Physical parameter: viscosity 
-        self.viscosity = nn.Parameter(torch.tensor([0.0035], dtype=torch.float32))
+        self.viscosity = nn.Parameter(torch.tensor([-5.65], dtype=torch.float32))
     
     def forward(self, x):
         out = self.activation(self.input_layer(x))
