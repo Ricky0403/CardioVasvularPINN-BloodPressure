@@ -34,7 +34,7 @@ Batch_Size = 15000
 Epoches = 5000
 LEARNING_RATE = 1e-3       
 save_dir = "../Models"
-SAVE_PATH = os.path.join(save_dir, "pinn_model_tanh.pth")
+SAVE_PATH = os.path.join(save_dir, "pinn_model_sigmoid.pth")
 os.makedirs(save_dir, exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -107,7 +107,7 @@ for epoch in range(Epoches):
             
         loss_physics = get_physics_loss(prediction, x_batch, F.softplus(model.viscosity), ones_wrapper, scales=scales)
             
-        loss = loss_data*100.0 + loss_physics
+        loss = loss_data + loss_physics
             
         loss.backward()
         optimizer.step()
