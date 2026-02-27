@@ -90,12 +90,26 @@ model = PINN(
 ).to(device)
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
+# CHECKPOINT
+CHECKPOINT_PATH = os.path.join(save_dir, "pinn_checkpoint.pth")
+start_epoch = 0
+
+if os.path.exists(CHECKPOINT_PATH):
+    print(f"Found checkpoint at {CHECKPOINT_PATH}. Loading...")
+    checkpoint = torch.load(CHECKPOINT_PATH)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    start_epoch = checkpoint['epoch'] + 1
+    print(f"Resuming training from Epoch {start_epoch}")
+else:
+    print("No checkpoint found. Starting fresh.")
+
 ones_wrapper = torch.ones((Batch_Size, 1), device=device, requires_grad=False)
 
 print("Starting Training")
 start_time = time.time()
 running_time = start_time
-for epoch in range(Epoches):
+for epoch in range(start_epoch, Epoches):
     total_loss = 0
     data_loss_accum = 0
     phys_loss_accum = 0
@@ -149,6 +163,14 @@ for epoch in range(Epoches):
               f"Val Acc (P): {val_acc:.2f}% | "    
               f"Visc: {current_mu:.5f} | "
               f"Time: {elapsed:.1f}s")
+        
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': avg_total
+        }, CHECKPOINT_PATH)
+        print("Checkpoint saved.")
         
         running_time = time.time()
 
