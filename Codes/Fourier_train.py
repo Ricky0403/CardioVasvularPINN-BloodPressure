@@ -114,18 +114,16 @@ for epoch in range(start_epoch, Epoches):
     phys_loss_accum = 0
 
     for batch_idx, (x_batch, u_batch, p_batch) in enumerate(train_loader):
-        x_batch = x_batch.clone().detach().requires_grad_(True)
-
+        x_batch = x_batch.clone().detach()
         optimizer.zero_grad()
 
         prediction = model(x_batch)
         u_pred = prediction[:, 0:3] 
 
+        # Calculate MSE Data Loss
         loss_data = F.mse_loss(u_pred, u_batch)
-            
-        loss_physics = get_physics_loss(model, x_batch, F.softplus(model.viscosity), scales)
-            
-        loss = loss_data + loss_physics
+        loss_physics = get_physics_loss(model, x_batch, prediction, F.softplus(model.viscosity), scales)
+        loss = loss_data  + loss_physics
             
         loss.backward()
         optimizer.step()
@@ -140,8 +138,8 @@ for epoch in range(start_epoch, Epoches):
         # Run a full forward pass on ALL data to check accuracy
         with torch.no_grad():
             full_pred = model(X_norm)
-            u_full_pred = full_pred[:, 0:3] # Predicted Velocity
-            p_full_pred = full_pred[:, 3:4] # Predicted Pressure
+            u_full_pred = full_pred[:, 0:3] 
+            p_full_pred = full_pred[:, 3:4] 
             
             # --- A. Training Accuracy (Velocity) ---
             _, train_acc = calculate_metrics(u_full_pred, U_norm)
