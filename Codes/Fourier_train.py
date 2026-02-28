@@ -41,6 +41,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 data_path = r"../VelocityData3D" 
+#data_path = r"/kaggle/input/datasets/rickygeorgek/velocitydata3d" #kaggle
 raw_loader = PINN_DataLoader(data_path)
     
 num_files = len(raw_loader.files)
@@ -104,8 +105,6 @@ if os.path.exists(CHECKPOINT_PATH):
 else:
     print("No checkpoint found. Starting fresh.")
 
-ones_wrapper = torch.ones((Batch_Size, 1), device=device, requires_grad=False)
-
 print("Starting Training")
 start_time = time.time()
 running_time = start_time
@@ -124,7 +123,7 @@ for epoch in range(start_epoch, Epoches):
 
         loss_data = F.mse_loss(u_pred, u_batch)
             
-        loss_physics = get_physics_loss(prediction, x_batch, F.softplus(model.viscosity), ones_wrapper, scales=scales)
+        loss_physics = get_physics_loss(model, x_batch, F.softplus(model.viscosity), scales)
             
         loss = loss_data + loss_physics
             

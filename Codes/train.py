@@ -85,8 +85,6 @@ train_loader = DataLoader(dataset, batch_size=Batch_Size, shuffle=True)
 model = PINN(layers=[4, 64, 64, 64, 64, 64, 64, 64, 4], activation=nn.SiLU()).to(device)
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-ones_wrapper = torch.ones((Batch_Size, 1), device=device, requires_grad=False)
-
 print("Starting Training")
 start_time = time.time()
 running_time = start_time
@@ -105,7 +103,7 @@ for epoch in range(Epoches):
 
         loss_data = F.mse_loss(u_pred, u_batch)
             
-        loss_physics = get_physics_loss(prediction, x_batch, F.softplus(model.viscosity), ones_wrapper, scales=scales)
+        loss_physics = get_physics_loss(model, x_batch, F.softplus(model.viscosity), scales)
             
         loss = loss_data + loss_physics
             
