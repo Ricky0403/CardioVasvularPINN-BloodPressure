@@ -45,25 +45,38 @@ def get_physics_loss(prediction, x_norm, viscosity, ones_tensor, scales):
     p_y = p_g[:, 1:2] * (s_p / s_y)
     p_z = p_g[:, 2:3] * (s_p / s_z)
 
-    # 4. Second Derivatives (Viscosity term)
+    # 4. Second Derivatives
     
-    # Gradients of the normalized first derivatives
-    u_gg = torch.autograd.grad(u_g, x_norm, grad_outputs=torch.ones_like(u_g), create_graph=True)[0]
-    v_gg = torch.autograd.grad(v_g, x_norm, grad_outputs=torch.ones_like(v_g), create_graph=True)[0]
-    w_gg = torch.autograd.grad(w_g, x_norm, grad_outputs=torch.ones_like(w_g), create_graph=True)[0]
+    u_x_raw, u_y_raw, u_z_raw = u_g[:, 0:1], u_g[:, 1:2], u_g[:, 2:3]
+    v_x_raw, v_y_raw, v_z_raw = v_g[:, 0:1], v_g[:, 1:2], v_g[:, 2:3]
+    w_x_raw, w_y_raw, w_z_raw = w_g[:, 0:1], w_g[:, 1:2], w_g[:, 2:3]
 
-    u_xx = u_gg[:, 0:1] * (s_u / s_x**2)
-    u_yy = u_gg[:, 1:2] * (s_u / s_y**2)
-    u_zz = u_gg[:, 2:3] * (s_u / s_z**2)
+    u_xx_grad = torch.autograd.grad(u_x_raw, x_norm, grad_outputs=torch.ones_like(u_x_raw), create_graph=True)[0]
+    u_xx = u_xx_grad[:, 0:1] * (s_u / s_x**2)
 
-    v_xx = v_gg[:, 0:1] * (s_v / s_x**2)
-    v_yy = v_gg[:, 1:2] * (s_v / s_y**2)
-    v_zz = v_gg[:, 2:3] * (s_v / s_z**2)
+    u_yy_grad = torch.autograd.grad(u_y_raw, x_norm, grad_outputs=torch.ones_like(u_y_raw), create_graph=True)[0]
+    u_yy = u_yy_grad[:, 1:2] * (s_u / s_y**2)
 
-    w_xx = w_gg[:, 0:1] * (s_w / s_x**2)
-    w_yy = w_gg[:, 1:2] * (s_w / s_y**2)
-    w_zz = w_gg[:, 2:3] * (s_w / s_z**2)
+    u_zz_grad = torch.autograd.grad(u_z_raw, x_norm, grad_outputs=torch.ones_like(u_z_raw), create_graph=True)[0]
+    u_zz = u_zz_grad[:, 2:3] * (s_u / s_z**2)
 
+    v_xx_grad = torch.autograd.grad(v_x_raw, x_norm, grad_outputs=torch.ones_like(v_x_raw), create_graph=True)[0]
+    v_xx = v_xx_grad[:, 0:1] * (s_v / s_x**2)
+
+    v_yy_grad = torch.autograd.grad(v_y_raw, x_norm, grad_outputs=torch.ones_like(v_y_raw), create_graph=True)[0]
+    v_yy = v_yy_grad[:, 1:2] * (s_v / s_y**2)
+
+    v_zz_grad = torch.autograd.grad(v_z_raw, x_norm, grad_outputs=torch.ones_like(v_z_raw), create_graph=True)[0]
+    v_zz = v_zz_grad[:, 2:3] * (s_v / s_z**2)
+
+    w_xx_grad = torch.autograd.grad(w_x_raw, x_norm, grad_outputs=torch.ones_like(w_x_raw), create_graph=True)[0]
+    w_xx = w_xx_grad[:, 0:1] * (s_w / s_x**2)
+
+    w_yy_grad = torch.autograd.grad(w_y_raw, x_norm, grad_outputs=torch.ones_like(w_y_raw), create_graph=True)[0]
+    w_yy = w_yy_grad[:, 1:2] * (s_w / s_y**2)
+
+    w_zz_grad = torch.autograd.grad(w_z_raw, x_norm, grad_outputs=torch.ones_like(w_z_raw), create_graph=True)[0]
+    w_zz = w_zz_grad[:, 2:3] * (s_w / s_z**2)
     # 5. Reconstruct Real Values for Interaction Terms
     u_real = u_norm * s_u
     v_real = v_norm * s_v

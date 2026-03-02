@@ -1,7 +1,7 @@
 import pyvista as pv
 import numpy as np
 # 1. Load the mesh
-mesh = pv.read("..\VelocityData3D\Velocity_06400.vtu")
+mesh = pv.read("..\VelocityData3D\Velocity_10000.vtu")
 
 # 2. Print what's inside (Check variable names!)
 print("Available Data Arrays:", mesh.array_names)
