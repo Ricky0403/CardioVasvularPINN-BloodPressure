@@ -35,7 +35,7 @@ def calculate_metrics(prediction, target):
 # --- HYPERPARAMETERS ---
 EPOCHS = 10000
 PRETRAIN_EPOCHS = 3000 
-BATCH_SIZE = 80000
+BATCH_SIZE = 15000
 LEARNING_RATE = 1e-3
 
 # --- CHECKPOINTING SETUP ---
