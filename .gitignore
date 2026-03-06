@@ -3,3 +3,8 @@
 /Models
 /__pycache__
 *.pyc
+*.csv
+*.pth
+*.tar
+aikosh_unified_data.csv
+cardiovascular_data.csv
