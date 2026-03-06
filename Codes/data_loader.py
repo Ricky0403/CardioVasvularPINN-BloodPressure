@@ -46,12 +46,9 @@ class DataLoader:
             b_mask = (distances < 1e-4).astype(bool)
             
             vel = mesh.point_data["velocity"]
-            
-            # THE FIX: Force pressure to be a 2D column vector (N, 1) immediately 
-            pres = mesh.point_data["pressure"].reshape(-1, 1)
-            
             # Extract Wall Shear Stress from the VTU
-            wall_shear_stress = mesh.point_data["vWSS"] 
+            pres = mesh.point_data["pressure"].reshape(-1, 1)
+            wall_shear_stress = mesh.point_data["vWSS"].reshape(-1, 3)
 
             time = np.full((coords.shape[0], 1), time_val)
 
