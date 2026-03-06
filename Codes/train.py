@@ -14,11 +14,28 @@ from normalizer import MinMaxNormalizer
 
 torch.set_float32_matmul_precision('high')
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(DEVICE)
+
+
+def calculate_metrics(prediction, target):
+    with torch.no_grad():
+        # 1. MSE Loss
+        mse = F.mse_loss(prediction, target)
+        
+        # 2. Relative L2 Accuracy
+        error_norm = torch.norm(prediction - target)
+        target_norm = torch.norm(target)
+        
+        # Add small epsilon to avoid division by zero
+        relative_error = error_norm / (target_norm + 1e-8)
+        accuracy = (1.0 - relative_error.item()) * 100.0
+        
+    return mse.item(), accuracy
 
 # --- HYPERPARAMETERS ---
 EPOCHS = 10000
 PRETRAIN_EPOCHS = 3000 
-BATCH_SIZE = 15000
+BATCH_SIZE = 80000
 LEARNING_RATE = 1e-3
 
 # --- CHECKPOINTING SETUP ---
@@ -63,6 +80,7 @@ scales = {
 
 dataset = TensorDataset(X, Y_vel, Y_pres, Y_wss, b_mask)
 train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+global_ones_tensor = torch.ones((BATCH_SIZE, 1), dtype=torch.float32, device=DEVICE, requires_grad=False)
 
 # 3. Initialize Model & Optimizer
 layers = [5, 64, 64, 64, 64, 64, 64, 64, 4]
@@ -135,7 +153,10 @@ for epoch in range(start_epoch, EPOCHS):
             if (~mask_batch).any():
                 pred_interior = model(x_interior)
                 loss_vel = F.mse_loss(pred_interior[:, 0:3], v_batch[~mask_batch])
-                loss_pde = get_physics_loss(pred_interior, x_interior, mu_positive, scales)
+
+                current_size = x_interior.shape[0]
+                batch_ones = global_ones_tensor[:current_size]
+                loss_pde = get_physics_loss(pred_interior, x_interior, mu_positive, scales, batch_ones)
             
             # SAFEGUARD: Boundary Physics
             if mask_batch.any():
@@ -156,12 +177,37 @@ for epoch in range(start_epoch, EPOCHS):
         epoch_loss += loss.item()
         
     # Terminal Output
+    # Terminal Output
     if epoch % 100 == 0:
+        model.eval()
+        with torch.no_grad():
+            # Do a fresh forward pass on the last batch to guarantee variables exist
+            eval_preds = model(x_batch)
+            eval_vel = eval_preds[:, 0:3]
+            eval_pres = eval_preds[:, 3:4]
+            
+            # Calculate Training Accuracy (Velocity)
+            train_mse, train_acc = calculate_metrics(eval_vel, v_batch)
+            
+            # Calculate Validation Accuracy (Pressure) - With NaN Safeguard
+            val_acc = 0.0
+            if mask_batch.any():
+                val_mse, val_acc = calculate_metrics(eval_pres[mask_batch], p_batch[mask_batch])
+            
         current_mu = F.softplus(model.viscosity).item()
-        print(f"Epoch {epoch} | Loss: {epoch_loss/len(train_loader):.5f} | Viscosity (mu): {current_mu:.5f}")
+        elapsed = time.time() - start_time
+        
+        print(f"Epoch {epoch} | "
+              f"Loss: {epoch_loss/len(train_loader):.5f} | "
+              f"Train Acc (U): {train_acc:.2f}% | "
+              f"Val Acc (P): {val_acc:.2f}% | "
+              f"Visc: {current_mu:.5f} | "
+              f"Time: {elapsed:.1f}s")
+        
+        model.train()
 
     # --- SAVE CHECKPOINT ---
-    if epoch > 0 and epoch % 500 == 0:
+    if epoch > 0 and epoch % 100 == 0:
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),

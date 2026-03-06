@@ -10,7 +10,7 @@ def get_gradients(y, x):
     )[0]
     return grad
 
-def get_physics_loss(prediction, x_norm, viscosity, scales):
+def get_physics_loss(prediction, x_norm, viscosity, scales, ones_tensor):
     """
     Calculates Navier-Stokes Residuals using the Chain Rule for Normalized Data.
     """
@@ -23,7 +23,6 @@ def get_physics_loss(prediction, x_norm, viscosity, scales):
     # 2. Get Normalized Predictions
     u_norm, v_norm, w_norm, p_norm = prediction[:,0:1], prediction[:,1:2], prediction[:,2:3], prediction[:,3:4]
     
-    ones_tensor = torch.ones_like(u_norm)
 
     # 3. Calculate Normalized Gradients
     u_g = torch.autograd.grad(u_norm, x_norm, grad_outputs=ones_tensor, create_graph=True)[0]
