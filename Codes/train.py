@@ -2,236 +2,175 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data import TensorDataset, DataLoader
 import torch.nn.functional as F
 import time
 
 # Import custom modules
-from normalizer import MinMaxNormalizer
 from data_loader import DataLoader as PINN_DataLoader
 from model import PINNModel as PINN
-from physics_loss import get_physics_loss
+from physics_loss import get_physics_loss, get_wss_loss
+from normalizer import MinMaxNormalizer
 
 torch.set_float32_matmul_precision('high')
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def calculate_metrics(prediction, target):
-    with torch.no_grad():
-        # 1. MSE Loss
-        mse = F.mse_loss(prediction, target)
-        
-        # 2. Relative L2 Accuracy
-        error_norm = torch.norm(prediction - target)
-        target_norm = torch.norm(target)
-        
-        # Add small epsilon to avoid division by zero
-        relative_error = error_norm / (target_norm + 1e-8)
-        accuracy = (1.0 - relative_error.item()) * 100.0
-        
-    return mse.item(), accuracy
+# --- HYPERPARAMETERS ---
+EPOCHS = 10000
+PRETRAIN_EPOCHS = 3000 
+BATCH_SIZE = 15000
+LEARNING_RATE = 1e-3
 
-Total_Duration = 1.0
-Batch_Size = 15000
-Epoches = 5000
-LEARNING_RATE = 1e-3       
-save_dir = "../Models"
-SAVE_PATH = os.path.join(save_dir, "pinn_model_sigmoid.pth")
-os.makedirs(save_dir, exist_ok=True)
+# --- CHECKPOINTING SETUP ---
+SAVE_DIR = "../Models"
+CHECKPOINT_PATH = os.path.join(SAVE_DIR, "pinn_checkpoint.pth")
+FINAL_MODEL_PATH = os.path.join(SAVE_DIR, "pinn_final.pth")
+os.makedirs(SAVE_DIR, exist_ok=True)
+RESUME_TRAINING = False 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+# 1. Load Data
+loader = PINN_DataLoader(folder_path="../VelocityData3D", wall_file_path="../VelocityData3D/WallMesh/wall.vtp")
+coords_t, vel, pres, wss, b_mask = loader.load(time_step=0.2)
 
-data_path = r"../VelocityData3D" 
-wall_path = os.path.join(data_path, "WallMesh", "wall.vtp")
-raw_loader = PINN_DataLoader(data_path,wall_path)
-    
-num_files = len(raw_loader.files)
-dt = Total_Duration / num_files
+# 2. Normalize Data
+norm_coords = MinMaxNormalizer(coords_t, method='column-wise', device=DEVICE)
+norm_vel = MinMaxNormalizer(vel, method='global', device=DEVICE)
+norm_pres = MinMaxNormalizer(pres, method='global', device=DEVICE)
+norm_wss = MinMaxNormalizer(wss, method='global', device=DEVICE)
 
-X, U, P = raw_loader.load(time_step=dt)
+X = norm_coords.encode(coords_t).to(DEVICE)
+Y_vel = norm_vel.encode(vel).to(DEVICE)
+Y_pres = norm_pres.encode(pres).to(DEVICE)
+Y_wss = norm_wss.encode(wss).to(DEVICE)
+b_mask = b_mask.to(DEVICE).squeeze()
 
-spatial_normalizer = MinMaxNormalizer(X, method='column-wise', device=device)
-velocity_normalizer = MinMaxNormalizer(U, method='global', device=device)
-pressure_normalizer = MinMaxNormalizer(P, method='global', device=device)
-
-X_norm = spatial_normalizer.encode(X)
-U_norm = velocity_normalizer.encode(U)
-P_norm = pressure_normalizer.encode(P)
-
-X_norm = X_norm.to(device)
-U_norm = U_norm.to(device)
-P_norm = P_norm.to(device)
+def get_range(normalizer, dim=None):
+    diff = normalizer.max - normalizer.min
+    if normalizer.method == 'column-wise':
+        return diff[dim].item()
+    return diff.item()
 
 scales = {
-    'x': (spatial_normalizer.max[0] - spatial_normalizer.min[0]) / 2.0,
-    'y': (spatial_normalizer.max[1] - spatial_normalizer.min[1]) / 2.0,
-    'z': (spatial_normalizer.max[2] - spatial_normalizer.min[2]) / 2.0,
-    't': (spatial_normalizer.max[3] - spatial_normalizer.min[3]) / 2.0,
-    'd': (spatial_normalizer.max[4] - spatial_normalizer.min[4]) / 2.0,
-
-    'u': (velocity_normalizer.max - velocity_normalizer.min) / 2.0,
-    'v': (velocity_normalizer.max - velocity_normalizer.min) / 2.0,
-    'w': (velocity_normalizer.max - velocity_normalizer.min) / 2.0,
-
-    'p': (pressure_normalizer.max - pressure_normalizer.min) / 2.0
+    'x': get_range(norm_coords, 0),
+    'y': get_range(norm_coords, 1),
+    'z': get_range(norm_coords, 2),
+    't': get_range(norm_coords, 3),
+    'u': get_range(norm_vel),
+    'v': get_range(norm_vel),
+    'w': get_range(norm_vel),
+    'p': get_range(norm_pres)
 }
 
-for key in scales:
-    if isinstance(scales[key], torch.Tensor):
-        scales[key] = scales[key].to(device)
-    else:
-        scales[key] = torch.tensor(scales[key]).to(device)
+dataset = TensorDataset(X, Y_vel, Y_pres, Y_wss, b_mask)
+train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-dataset = TensorDataset(X_norm, U_norm, P_norm)
-total_points = len(dataset)
-
-# --- 1. THE STRICT 80/10/10 MATH ---
-train_size = int(0.80 * total_points)
-val_size = int(0.10 * total_points)
-# We calculate test_size by subtracting the other two to guarantee the sum is perfect
-test_size = total_points - train_size - val_size 
-
-print(f"Data Split -> Train: {train_size} | Val: {val_size} | Test: {test_size}")
-
-# --- 2. THE 3-WAY RANDOM SPLIT ---
-train_dataset, val_dataset, test_dataset = random_split(
-    dataset, 
-    [train_size, val_size, test_size]
-)
-
-train_loader = DataLoader(train_dataset, batch_size=Batch_Size, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=Batch_Size, shuffle=False)
-test_loader = DataLoader(test_dataset, batch_size=Batch_Size, shuffle=False)
-
-model = PINN(layers=[5, 64, 64, 64, 64, 64, 64, 64, 4], activation=nn.SiLU()).to(device)
+# 3. Initialize Model & Optimizer
+layers = [5, 64, 64, 64, 64, 64, 64, 64, 4]
+model = PINN(layers).to(DEVICE)
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-ones_wrapper = torch.ones((Batch_Size, 1), device=device, requires_grad=False)
-
-# --- CHECKPOINT SETUP ---
-CHECKPOINT_PATH = os.path.join(save_dir, "pinn_checkpoint.pth")
 start_epoch = 0
 
-if os.path.exists(CHECKPOINT_PATH):
-    print(f"Found checkpoint at {CHECKPOINT_PATH}. Loading...")
-    checkpoint = torch.load(CHECKPOINT_PATH)
+# --- RESUME FROM CHECKPOINT LOGIC ---
+if RESUME_TRAINING and os.path.exists(CHECKPOINT_PATH):
+    print(f"Loading checkpoint from {CHECKPOINT_PATH}...")
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     start_epoch = checkpoint['epoch'] + 1
-    print(f"Resuming training from Epoch {start_epoch}")
+    print(f"Resumed training from epoch {start_epoch}")
+
+# --- SET INITIAL CURRICULUM STATE ---
+if start_epoch < PRETRAIN_EPOCHS:
+    print(f"Starting in Phase 1. Viscosity frozen.")
+    model.freeze_viscosity()
 else:
-    print("No checkpoint found. Starting fresh.")
+    print(f"Starting in Phase 2. Viscosity unfrozen.")
+    model.unfreeze_viscosity()
 
-print("Starting Training")
+# 4. Training Loop
+model.train()
 start_time = time.time()
-running_time = start_time
-for epoch in range(start_epoch, Epoches+1):
-    total_loss = 0
-    data_loss_accum = 0
-    phys_loss_accum = 0
 
-    for batch_idx, (x_batch, u_batch, p_batch) in enumerate(train_loader):
-        x_batch = x_batch.clone().detach().requires_grad_(True)
+for epoch in range(start_epoch, EPOCHS):
+    epoch_loss = 0
+    
+    # Only listen for the exact transition moment
+    if epoch == PRETRAIN_EPOCHS:
+        print("Transitioning to Phase 2: Physics-Informed. Viscosity unfrozen.")
+        model.unfreeze_viscosity()
 
+    for x_batch, v_batch, p_batch, wss_batch, mask_batch in train_loader:
         optimizer.zero_grad()
-
-        prediction = model(x_batch)
-        u_pred = prediction[:, 0:3] 
-
-        loss_data = F.mse_loss(u_pred, u_batch)
+        
+        if epoch < PRETRAIN_EPOCHS:
+            # PHASE 1: Simple unified pass (NO requires_grad overhead here!)
+            predictions = model(x_batch)
+            pred_vel = predictions[:, 0:3]
+            pred_pres = predictions[:, 3:4]
             
-        loss_physics = get_physics_loss(prediction, x_batch, F.softplus(model.viscosity), ones_wrapper, scales=scales)
-        
-        p_norm = prediction[:, 3:4]         
-        p_real = p_norm * scales['p']
-        
-        P_MAX = 8000.0  
-        P_MIN = 0.0   
-        VISC_MAX = 0.006 
-        VISC_MIN = 0.002
-        
-        current_visc = F.softplus(model.viscosity)
-        
-        # Pressure Penalties
-        loss_p_upper = torch.mean(F.relu(p_real - P_MAX)**2)
-        loss_p_lower = torch.mean(F.relu(P_MIN - p_real)**2)
-        
-        # Viscosity Penalties
-        loss_v_upper = F.relu(current_visc - VISC_MAX)**2
-        loss_v_lower = F.relu(VISC_MIN - current_visc)**2
-        
-        loss = loss_data + loss_physics + loss_p_upper + loss_p_lower + loss_v_upper + loss_v_lower
+            loss_vel = F.mse_loss(pred_vel, v_batch)
+            
+            # SAFEGUARD: Phase 1 NaN Trap
+            loss_pres_boundary = 0.0
+            if mask_batch.any(): 
+                loss_pres_boundary = F.mse_loss(pred_pres[mask_batch], p_batch[mask_batch])
+                
+            loss = loss_vel + loss_pres_boundary
+            
+        else:
+            # PHASE 2: True PINN (Graph-safe splitting & Memory Optimization)
+            x_boundary = x_batch[mask_batch].clone().detach().requires_grad_(True)
+            x_interior = x_batch[~mask_batch].clone().detach().requires_grad_(True)
+            
+            mu_positive = F.softplus(model.viscosity)
+            
+            loss_vel = 0.0
+            loss_pde = 0.0
+            loss_vel_bnd = 0.0
+            loss_pres_boundary = 0.0
+            loss_wss = 0.0
+            
+            # SAFEGUARD: Interior Physics
+            if (~mask_batch).any():
+                pred_interior = model(x_interior)
+                loss_vel = F.mse_loss(pred_interior[:, 0:3], v_batch[~mask_batch])
+                loss_pde = get_physics_loss(pred_interior, x_interior, mu_positive, scales)
+            
+            # SAFEGUARD: Boundary Physics
+            if mask_batch.any():
+                pred_boundary = model(x_boundary)
+                
+                loss_vel_bnd = F.mse_loss(pred_boundary[:, 0:3], v_batch[mask_batch])
+                loss_pres_boundary = F.mse_loss(pred_boundary[:, 3:4], p_batch[mask_batch])
+                
+                wss_target_norm = wss_batch[mask_batch]
+                wss_target_real = norm_wss.decode(wss_target_norm)
+                
+                loss_wss = get_wss_loss(pred_boundary, x_boundary, wss_target_real, mu_positive, scales)
+            
+            loss = loss_vel + loss_vel_bnd + loss_pde + loss_wss + loss_pres_boundary
             
         loss.backward()
         optimizer.step()
-            
-        total_loss += loss.item()
-        data_loss_accum += loss_data.item()
-        phys_loss_accum += loss_physics.item()
-
+        epoch_loss += loss.item()
+        
+    # Terminal Output
     if epoch % 100 == 0:
-        elapsed = time.time() - running_time
-        model.eval()
-        
-        # Run a full forward pass on ALL data to check accuracy
-        with torch.no_grad():
-            # 1. Extract the exact Tensors for Train and Val subsets
-            X_train_full = dataset.tensors[0][train_dataset.indices]
-            U_train_full = dataset.tensors[1][train_dataset.indices]
-            
-            X_val_full = dataset.tensors[0][val_dataset.indices]
-            P_val_full = dataset.tensors[2][val_dataset.indices]
-            
-            # --- A. Training Accuracy (Velocity on the Train Split) ---
-            pred_train = model(X_train_full)
-            u_train_pred = pred_train[:, 0:3] 
-            _, train_acc = calculate_metrics(u_train_pred, U_train_full)
-            
-            # --- B. Validation Accuracy (Pressure on the Val Split) ---
-            pred_val = model(X_val_full)
-            p_val_pred = pred_val[:, 3:4] 
-            val_loss, val_acc = calculate_metrics(p_val_pred, P_val_full)
-        
         current_mu = F.softplus(model.viscosity).item()
-        
-        # Averages for printing (Using accumulated values from the batch loop)
-        avg_total = total_loss / len(train_loader)
-        avg_data = data_loss_accum / len(train_loader)
-        avg_phys = phys_loss_accum / len(train_loader)
+        print(f"Epoch {epoch} | Loss: {epoch_loss/len(train_loader):.5f} | Viscosity (mu): {current_mu:.5f}")
 
-        print(f"Epoch {epoch} | "
-              f"Loss: {avg_total:.4f} | "
-              f"Train Acc (U): {train_acc:.2f}% | "
-              f"Val Acc (P): {val_acc:.2f}% | "    
-              f"Visc: {current_mu:.5f} | "
-              f"Time: {elapsed:.1f}s")
-        
+    # --- SAVE CHECKPOINT ---
+    if epoch > 0 and epoch % 500 == 0:
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
         }, CHECKPOINT_PATH)
-        print("Checkpoint saved.")
-        # Switch back to training mode
-        model.train()
-        
-        running_time = time.time()
+        print(f"--> Checkpoint saved at epoch {epoch}")
 
+# --- SAVE FINAL MODEL ---
 end_time = time.time()
 print(f"\nTraining Complete in {(end_time - start_time)/60:.2f} minutes.")
-torch.save(model.state_dict(), SAVE_PATH)
-
-
-model.eval()
-test_loss_accum = 0
-
-with torch.no_grad():
-    for x_test, u_test, p_test in test_loader:
-        test_pred = model(x_test)
-        u_test_pred = test_pred[:, 0:3]
-        
-        # Calculate Final MSE
-        t_loss = F.mse_loss(u_test_pred, u_test)
-        test_loss_accum += t_loss.item()
-
-final_test_mse = test_loss_accum / len(test_loader)
-print(f"FINAL MSE: {final_test_mse:.6f}")
+torch.save(model.state_dict(), FINAL_MODEL_PATH)
+print(f"Final model saved to {FINAL_MODEL_PATH}")
