@@ -33,8 +33,8 @@ def calculate_metrics(prediction, target):
     return mse.item(), accuracy
 
 # --- HYPERPARAMETERS ---
-EPOCHS = 10000
-PRETRAIN_EPOCHS = 3000 
+EPOCHS = 5000
+PRETRAIN_EPOCHS = 1000 
 BATCH_SIZE = 15000
 LEARNING_RATE = 1e-3
 
