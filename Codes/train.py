@@ -80,7 +80,10 @@ scales = {
     'u': get_range(norm_vel),
     'v': get_range(norm_vel),
     'w': get_range(norm_vel),
-    'p': get_range(norm_pres)
+    'p': get_range(norm_pres),
+    'min_u': get_min(norm_vel),
+    'min_v': get_min(norm_vel),
+    'min_w': get_min(norm_vel)
 }
 
 dataset = TensorDataset(X, Y_vel, Y_pres, Y_wss, b_mask)
