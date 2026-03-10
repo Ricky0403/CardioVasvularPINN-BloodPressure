@@ -43,7 +43,7 @@ SAVE_DIR = "../Models"
 CHECKPOINT_PATH = os.path.join(SAVE_DIR, "pinn_checkpoint.pth")
 FINAL_MODEL_PATH = os.path.join(SAVE_DIR, "pinn_final.pth")
 os.makedirs(SAVE_DIR, exist_ok=True)
-RESUME_TRAINING = False 
+RESUME_TRAINING = True
 
 # 1. Load Data
 loader = PINN_DataLoader(folder_path="../VelocityData3D", wall_file_path="../VelocityData3D/WallMesh/wall.vtp")
