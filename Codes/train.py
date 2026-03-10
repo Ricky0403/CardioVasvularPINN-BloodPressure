@@ -129,9 +129,9 @@ else:
 # 5. Training Loop
 model.train()
 start_time = time.time()
+current_time = time.time()
 
 for epoch in range(start_epoch, EPOCHS):
-    current_time = time.time()
     epoch_loss = 0
     
     # Only listen for the exact transition moment
@@ -182,7 +182,7 @@ for epoch in range(start_epoch, EPOCHS):
                 loss_vel = F.mse_loss(pred_interior[:, 0:3], v_batch[~mask_batch])
 
                 # 2. Pressure Guardrails (Moved safely AFTER pred_interior is defined)
-                p_real = pred_interior[:, 3:4] * scales['p']
+                p_real = norm_pres.decode(pred_interior[:, 3:4])
                 loss_p_upper = torch.mean(F.relu(p_real - 8000.0)**2)
                 loss_p_lower = torch.mean(F.relu(0.0 - p_real)**2)
 
