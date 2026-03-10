@@ -43,7 +43,7 @@ SAVE_DIR = "../Models"
 CHECKPOINT_PATH = os.path.join(SAVE_DIR, "pinn_checkpoint.pth")
 FINAL_MODEL_PATH = os.path.join(SAVE_DIR, "pinn_final.pth")
 os.makedirs(SAVE_DIR, exist_ok=True)
-RESUME_TRAINING = False 
+RESUME_TRAINING = True
 
 # 1. Load Data
 loader = PINN_DataLoader(folder_path="../VelocityData3D", wall_file_path="../VelocityData3D/WallMesh/wall.vtp")
@@ -83,9 +83,6 @@ scales = {
     'p': get_range(norm_pres)
 }
 
-# ==========================================
-# 3. SPLIT DATA & LOADERS (80/10/10)
-# ==========================================
 dataset = TensorDataset(X, Y_vel, Y_pres, Y_wss, b_mask)
 total_points = len(dataset)
 
@@ -169,11 +166,22 @@ for epoch in range(start_epoch, EPOCHS):
             loss_vel_bnd = 0.0
             loss_pres_boundary = 0.0
             loss_wss = 0.0
+            loss_p_upper = 0.0
+            loss_p_lower = 0.0
+            
+            # 1. Viscosity Guardrails
+            loss_v_upper = torch.mean(F.relu(mu_positive - 0.006)**2) * 1000.0
+            loss_v_lower = torch.mean(F.relu(0.002 - mu_positive)**2) * 1000.0
             
             # SAFEGUARD: Interior Physics
             if (~mask_batch).any():
                 pred_interior = model(x_interior)
                 loss_vel = F.mse_loss(pred_interior[:, 0:3], v_batch[~mask_batch])
+
+                # 2. Pressure Guardrails (Moved safely AFTER pred_interior is defined)
+                p_real = pred_interior[:, 3:4] * scales['p']
+                loss_p_upper = torch.mean(F.relu(p_real - 8000.0)**2)
+                loss_p_lower = torch.mean(F.relu(0.0 - p_real)**2)
 
                 current_size = x_interior.shape[0]
                 batch_ones = global_ones_tensor[:current_size]
@@ -189,22 +197,24 @@ for epoch in range(start_epoch, EPOCHS):
                 wss_target_norm = wss_batch[mask_batch]
                 wss_target_real = norm_wss.decode(wss_target_norm)
                 
-                # SLICE THE GLOBAL TENSOR FOR BOUNDARIES
                 current_b_size = x_boundary.shape[0]
                 batch_ones_bnd = global_ones_tensor[:current_b_size]
                 
-                # Pass it into the function
+                # PASS IT INTO THE FUNCTION
                 loss_wss = get_wss_loss(pred_boundary, x_boundary, wss_target_real, mu_positive, scales, batch_ones_bnd)
             
-            loss = loss_vel + loss_vel_bnd + loss_pde + loss_wss + loss_pres_boundary
+            # 3. Weighted Total Loss (Stops the viscosity from exploding)
+            weight_pde = 0.1
+            weight_wss = 0.1
+            
+            loss = (loss_vel + loss_vel_bnd + loss_pres_boundary + 
+                    (weight_pde * loss_pde) + (weight_wss * loss_wss) + 
+                    loss_v_upper + loss_v_lower + loss_p_upper + loss_p_lower)
             
         loss.backward()
         optimizer.step()
         epoch_loss += loss.item()
         
-    # ==========================================
-    # 6. EVALUATION & LOGGING
-    # ==========================================
     if epoch % 100 == 0:
         model.eval()
         with torch.no_grad():
@@ -246,9 +256,6 @@ for epoch in range(start_epoch, EPOCHS):
         }, CHECKPOINT_PATH)
         print(f"--> Checkpoint saved at epoch {epoch}")
 
-# ==========================================
-# 7. FINAL TEST EXAM
-# ==========================================
 end_time = time.time()
 print(f"\nTraining Complete in {(end_time - start_time)/60:.2f} minutes.")
 torch.save(model.state_dict(), FINAL_MODEL_PATH)
