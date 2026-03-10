@@ -167,11 +167,22 @@ for epoch in range(start_epoch, EPOCHS):
             loss_vel_bnd = 0.0
             loss_pres_boundary = 0.0
             loss_wss = 0.0
+            loss_p_upper = 0.0
+            loss_p_lower = 0.0
+            
+            # 1. Viscosity Guardrails
+            loss_v_upper = torch.mean(F.relu(mu_positive - 0.006)**2) * 1000.0
+            loss_v_lower = torch.mean(F.relu(0.002 - mu_positive)**2) * 1000.0
             
             # SAFEGUARD: Interior Physics
             if (~mask_batch).any():
                 pred_interior = model(x_interior)
                 loss_vel = F.mse_loss(pred_interior[:, 0:3], v_batch[~mask_batch])
+
+                # 2. Pressure Guardrails (Moved safely AFTER pred_interior is defined)
+                p_real = pred_interior[:, 3:4] * scales['p']
+                loss_p_upper = torch.mean(F.relu(p_real - 8000.0)**2)
+                loss_p_lower = torch.mean(F.relu(0.0 - p_real)**2)
 
                 current_size = x_interior.shape[0]
                 batch_ones = global_ones_tensor[:current_size]
@@ -193,7 +204,13 @@ for epoch in range(start_epoch, EPOCHS):
                 # PASS IT INTO THE FUNCTION
                 loss_wss = get_wss_loss(pred_boundary, x_boundary, wss_target_real, mu_positive, scales, batch_ones_bnd)
             
-            loss = loss_vel + loss_vel_bnd + loss_pde + loss_wss + loss_pres_boundary
+            # 3. Weighted Total Loss (Stops the viscosity from exploding)
+            weight_pde = 0.1
+            weight_wss = 0.1
+            
+            loss = (loss_vel + loss_vel_bnd + loss_pres_boundary + 
+                    (weight_pde * loss_pde) + (weight_wss * loss_wss) + 
+                    loss_v_upper + loss_v_lower + loss_p_upper + loss_p_lower)
             
         loss.backward()
         optimizer.step()

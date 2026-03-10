@@ -64,7 +64,7 @@ class DataLoader:
         return (
             torch.tensor(np.vstack(coordinates_and_time), dtype=torch.float32),
             torch.tensor(np.vstack(velocity), dtype=torch.float32),
-            torch.tensor(np.vstack(pressure), dtype=torch.float32), # Now perfectly outputs (3.2M, 1)
+            torch.tensor(np.vstack(pressure), dtype=torch.float32), 
             torch.tensor(np.vstack(wss), dtype=torch.float32),
             torch.tensor(np.vstack(boundary_masks), dtype=torch.bool)
         )
