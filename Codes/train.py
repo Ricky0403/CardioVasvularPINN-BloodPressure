@@ -1,176 +1,267 @@
+"""
+Training script for the 3-D Fourier Neural Operator (FNO).
+
+Paradigm shift from the original PINN training:
+  - PINN:  maps single point (x,y,z,t) → (u,v,w,p)       (point-wise)
+  - FNO:   maps entire 3-D field at time t → field at t+Δt (operator)
+
+The network is trained with pure supervised MSE loss on voxelized fields.
+No physics loss (autograd derivatives) is needed — the spectral convolutions
+in Fourier space capture the PDE dynamics directly from data.
+"""
+
 import os
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import torch.nn.functional as F
 import time
 
-# Import custom modules
-from normalizer import MinMaxNormalizer
-from data_loader import DataLoader as PINN_DataLoader
-from Codes.model import PINNModel as PINN
-from physics_loss import get_physics_loss
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 
-torch.set_float32_matmul_precision('high')
+from model import FNO3d
+from fno_data_loader import FNODataLoader
 
-def calculate_metrics(prediction, target):
-    with torch.no_grad():
-        # 1. MSE Loss
-        mse = F.mse_loss(prediction, target)
-        
-        # 2. Relative L2 Accuracy
-        error_norm = torch.norm(prediction - target)
-        target_norm = torch.norm(target)
-        
-        # Add small epsilon to avoid division by zero
-        relative_error = error_norm / (target_norm + 1e-8)
-        accuracy = (1.0 - relative_error.item()) * 100.0
-        
-    return mse.item(), accuracy
+torch.set_float32_matmul_precision("high")
 
-Total_Duration = 1.0
-Batch_Size = 15000
-Epoches = 5000
-LEARNING_RATE = 1e-3       
-save_dir = "../Models"
-SAVE_PATH = os.path.join(save_dir, "pinn_model_sigmoid.pth")
-os.makedirs(save_dir, exist_ok=True)
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
+GRID_RES   = 32        # Voxel resolution per spatial dimension
+MODES      = 8         # Fourier modes to keep per dim (must be ≤ GRID_RES // 2)
+WIDTH      = 32        # Hidden channel width  (dv in the paper)
+NUM_LAYERS = 4         # Number of Fourier layers  (paper: 4)
+
+BATCH_SIZE = 8
+EPOCHS     = 1000
+LR         = 1e-3
+LR_STEP    = 100       # Halve the LR every LR_STEP epochs (paper: 100)
+LR_GAMMA   = 0.5
+WEIGHT_DECAY = 1e-4
+NOISE_STD  = 0.01      # Gaussian noise injected into inputs (regularization)
+
+DATA_PATH  = "../VelocityData3D"
+WALL_PATH  = "../VelocityData3D/WallMesh/wall.vtp"
+SAVE_DIR   = "../Models"
+
+CHECKPOINT_PATH = os.path.join(SAVE_DIR, "fno_checkpoint.pth")
+SAVE_PATH       = os.path.join(SAVE_DIR, "fno_model.pth")
+os.makedirs(SAVE_DIR, exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-data_path = r"../VelocityData3D" 
-#data_path = r"/kaggle/input/datasets/rickygeorgek/velocitydata3d" #kaggle
-raw_loader = PINN_DataLoader(data_path)
-    
-num_files = len(raw_loader.files)
-dt = Total_Duration / num_files
 
-X, U, P = raw_loader.load(time_step=dt)
+# ═══════════════════════════════════════════════════════════════════════════
+#  1. LOAD & VOXELIZE DATA
+# ═══════════════════════════════════════════════════════════════════════════
+loader = FNODataLoader(DATA_PATH, wall_file_path=WALL_PATH, resolution=GRID_RES)
+fields, mask, grid_coords, stats = loader.load()
 
-spatial_normalizer = MinMaxNormalizer(X, method='column-wise', device=device)
-velocity_normalizer = MinMaxNormalizer(U, method='global', device=device)
-pressure_normalizer = MinMaxNormalizer(P, method='global', device=device)
+# fields      : (T, 4, res, res, res)  — standardized velocity(3) + pressure(1)
+# mask        : (res, res, res)         — binary vessel mask
+# grid_coords : (3, res, res, res)      — normalised spatial coordinates [0,1]
 
-X_norm = spatial_normalizer.encode(X)
-U_norm = velocity_normalizer.encode(U)
-P_norm = pressure_normalizer.encode(P)
+T = fields.shape[0]
+print(f"Total timesteps: {T}, training pairs: {T - 1}")
 
-X_norm = X_norm.to(device)
-U_norm = U_norm.to(device)
-P_norm = P_norm.to(device)
 
-scales = {
-    'x': (spatial_normalizer.max[0] - spatial_normalizer.min[0]) / 2.0,
-    'y': (spatial_normalizer.max[1] - spatial_normalizer.min[1]) / 2.0,
-    'z': (spatial_normalizer.max[2] - spatial_normalizer.min[2]) / 2.0,
-    't': (spatial_normalizer.max[3] - spatial_normalizer.min[3]) / 2.0,
+# ═══════════════════════════════════════════════════════════════════════════
+#  2. DATASET  — consecutive timestep pairs
+# ═══════════════════════════════════════════════════════════════════════════
+class TimeStepDataset(Dataset):
+    """
+    Each sample is a pair  (field[t], field[t+1]).
+    Input channels:  velocity(3) + pressure(1) + mask(1) + coords(3) = 8
+    Target channels: velocity(3) + pressure(1) = 4
+    """
 
-    'u': (velocity_normalizer.max - velocity_normalizer.min) / 2.0,
-    'v': (velocity_normalizer.max - velocity_normalizer.min) / 2.0,
-    'w': (velocity_normalizer.max - velocity_normalizer.min) / 2.0,
+    def __init__(self, fields, mask, coords, noise_std=0.0):
+        self.fields    = fields
+        self.mask_ch   = mask.unsqueeze(0)     # (1, res, res, res)
+        self.coords    = coords                # (3, res, res, res)
+        self.noise_std = noise_std
+        self.n_pairs   = fields.shape[0] - 1
 
-    'p': (pressure_normalizer.max - pressure_normalizer.min) / 2.0
-}
+    def __len__(self):
+        return self.n_pairs
 
-for key in scales:
-    if isinstance(scales[key], torch.Tensor):
-        scales[key] = scales[key].to(device)
-    else:
-        scales[key] = torch.tensor(scales[key]).to(device)
+    def __getitem__(self, idx):
+        field_in  = self.fields[idx]         # (4, res³)
+        field_out = self.fields[idx + 1]     # (4, res³)
 
-dataset = TensorDataset(X_norm, U_norm, P_norm)
-train_loader = DataLoader(dataset, batch_size=Batch_Size, shuffle=True)
+        # Noise augmentation (only on the field channels, only inside vessel)
+        if self.noise_std > 0 and self.training_mode:
+            noise = self.noise_std * torch.randn_like(field_in)
+            field_in = field_in + noise * self.mask_ch
 
-model = PINN(
-    layers=[4, 64, 64, 64, 64, 64, 64, 64, 4], 
-    fourier_mapping_size=32, 
-    fourier_scale=1.0,        
-    activation=nn.SiLU()
+        inp = torch.cat([field_in, self.mask_ch, self.coords], dim=0)  # (8, res³)
+        return inp, field_out
+
+    # Called from the training loop to toggle noise on/off
+    training_mode = True
+
+
+dataset = TimeStepDataset(fields, mask, grid_coords, noise_std=NOISE_STD)
+train_loader = DataLoader(
+    dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True,
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  3. MODEL, OPTIMIZER, SCHEDULER
+# ═══════════════════════════════════════════════════════════════════════════
+in_ch  = 4 + 1 + 3   # field + mask + coords
+out_ch = 4            # velocity(3) + pressure(1)
+
+model = FNO3d(
+    modes1=MODES, modes2=MODES, modes3=MODES,
+    width=WIDTH,
+    in_channels=in_ch,
+    out_channels=out_ch,
+    num_layers=NUM_LAYERS,
 ).to(device)
-optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-# CHECKPOINT
-CHECKPOINT_PATH = os.path.join(save_dir, "pinn_checkpoint.pth")
+n_params = sum(p.numel() for p in model.parameters())
+print(f"FNO3d — {n_params:,} parameters")
+
+optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=LR_STEP, gamma=LR_GAMMA)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  4. CHECKPOINT LOADING
+# ═══════════════════════════════════════════════════════════════════════════
 start_epoch = 0
-
 if os.path.exists(CHECKPOINT_PATH):
-    print(f"Found checkpoint at {CHECKPOINT_PATH}. Loading...")
-    checkpoint = torch.load(CHECKPOINT_PATH)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    start_epoch = checkpoint['epoch'] + 1
-    print(f"Resuming training from Epoch {start_epoch}")
+    print(f"Loading checkpoint: {CHECKPOINT_PATH}")
+    ckpt = torch.load(CHECKPOINT_PATH, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    start_epoch = ckpt["epoch"] + 1
+    print(f"Resuming from epoch {start_epoch}")
 else:
-    print("No checkpoint found. Starting fresh.")
+    print("No checkpoint found — starting fresh.")
 
-print("Starting Training")
-start_time = time.time()
-running_time = start_time
-for epoch in range(start_epoch, Epoches):
-    total_loss = 0
-    data_loss_accum = 0
-    phys_loss_accum = 0
 
-    for batch_idx, (x_batch, u_batch, p_batch) in enumerate(train_loader):
-        x_batch = x_batch.clone().detach()
+# ═══════════════════════════════════════════════════════════════════════════
+#  5. HELPER METRICS
+# ═══════════════════════════════════════════════════════════════════════════
+mask_dev = mask.unsqueeze(0).unsqueeze(0).to(device)   # (1, 1, res, res, res)
+
+
+def masked_mse(pred, target):
+    """MSE loss inside the vessel only."""
+    sq = (pred - target) ** 2 * mask_dev
+    return sq.sum() / (mask_dev.sum() * pred.shape[1])
+
+
+@torch.no_grad()
+def masked_rel_l2(pred, target):
+    """Relative L2 error inside the vessel."""
+    d = (pred - target) * mask_dev
+    t = target * mask_dev
+    return torch.sqrt((d ** 2).sum() / ((t ** 2).sum() + 1e-8))
+
+
+def build_input(field_t):
+    """Construct a single FNO input from a field tensor."""
+    return torch.cat([field_t, mask.unsqueeze(0), grid_coords], dim=0).unsqueeze(0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  6. TRAINING LOOP
+# ═══════════════════════════════════════════════════════════════════════════
+print("\n--- Starting FNO Training ---")
+t_start = time.time()
+t_epoch = t_start
+
+for epoch in range(start_epoch, EPOCHS):
+    model.train()
+    dataset.training_mode = True
+    epoch_loss = 0.0
+
+    for inp, tgt in train_loader:
+        inp, tgt = inp.to(device), tgt.to(device)
+
         optimizer.zero_grad()
-
-        prediction = model(x_batch)
-        u_pred = prediction[:, 0:3] 
-
-        # Calculate MSE Data Loss
-        loss_data = F.mse_loss(u_pred, u_batch)
-        loss_physics = get_physics_loss(model, x_batch, prediction, F.softplus(model.viscosity), scales)
-        loss = loss_data  + loss_physics
-            
+        pred = model(inp)
+        loss = masked_mse(pred, tgt)
         loss.backward()
         optimizer.step()
-            
-        total_loss += loss.item()
-        data_loss_accum += loss_data.item()
-        phys_loss_accum += loss_physics.item()
 
+        epoch_loss += loss.item()
+
+    scheduler.step()
+    avg_loss = epoch_loss / len(train_loader)
+
+    # ── Periodic evaluation ──────────────────────────────────────────────
     if epoch % 100 == 0:
-        elapsed = time.time() - running_time
-        
-        # Run a full forward pass on ALL data to check accuracy
+        model.eval()
+        dataset.training_mode = False
+        elapsed = time.time() - t_epoch
+
+        # A. One-step accuracy (all pairs)
+        total_rel = 0.0
         with torch.no_grad():
-            full_pred = model(X_norm)
-            u_full_pred = full_pred[:, 0:3] 
-            p_full_pred = full_pred[:, 3:4] 
-            
-            # --- A. Training Accuracy (Velocity) ---
-            _, train_acc = calculate_metrics(u_full_pred, U_norm)
-            
-            # --- B. Validation Accuracy (Pressure) ---
-            val_loss, val_acc = calculate_metrics(p_full_pred, P_norm)
-        
-        current_mu = F.softplus(model.viscosity).item()
-        
-        # Averages for printing
-        avg_total = total_loss / len(train_loader)
-        avg_data = data_loss_accum / len(train_loader)
-        avg_phys = phys_loss_accum / len(train_loader)
+            for i in range(T - 1):
+                inp_i = build_input(fields[i]).to(device)
+                tgt_i = fields[i + 1].unsqueeze(0).to(device)
+                pred_i = model(inp_i)
+                total_rel += masked_rel_l2(pred_i, tgt_i).item()
+        avg_rel = total_rel / (T - 1)
+        acc_1step = (1.0 - avg_rel) * 100.0
 
-        print(f"Epoch {epoch} | "
-              f"Loss: {avg_total:.4f} | "
-              f"Train Acc (U): {train_acc:.2f}% | "
-              f"Val Acc (P): {val_acc:.2f}% | "    
-              f"Visc: {current_mu:.5f} | "
-              f"Time: {elapsed:.1f}s")
-        
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': avg_total
-        }, CHECKPOINT_PATH)
-        print("Checkpoint saved.")
-        
-        running_time = time.time()
+        # B. Autoregressive rollout (from t=0)
+        rollout_steps = min(10, T - 1)
+        current = fields[0].unsqueeze(0).to(device)
+        with torch.no_grad():
+            for s in range(rollout_steps):
+                inp_s = torch.cat(
+                    [current[0], mask.unsqueeze(0).to(device),
+                     grid_coords.to(device)], dim=0,
+                ).unsqueeze(0)
+                current = model(inp_s)
+        tgt_roll = fields[rollout_steps].unsqueeze(0).to(device)
+        rollout_acc = (1.0 - masked_rel_l2(current, tgt_roll).item()) * 100.0
 
-end_time = time.time()
-print(f"\nTraining Complete in {(end_time - start_time)/60:.2f} minutes.")
-torch.save(model.state_dict(), SAVE_PATH)
+        lr_now = optimizer.param_groups[0]["lr"]
+        print(
+            f"Epoch {epoch:4d} | Loss {avg_loss:.6f} | "
+            f"1-step Acc {acc_1step:.2f}% | "
+            f"Rollout-{rollout_steps} Acc {rollout_acc:.2f}% | "
+            f"LR {lr_now:.1e} | {elapsed:.1f}s"
+        )
+
+        # Save checkpoint
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "loss": avg_loss,
+                "stats": stats,
+                "mask": mask,
+                "grid_coords": grid_coords,
+            },
+            CHECKPOINT_PATH,
+        )
+        t_epoch = time.time()
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  7. SAVE FINAL MODEL
+# ═══════════════════════════════════════════════════════════════════════════
+total_mins = (time.time() - t_start) / 60
+print(f"\nTraining complete in {total_mins:.2f} min.")
+torch.save(
+    {
+        "model_state_dict": model.state_dict(),
+        "stats": stats,
+        "mask": mask,
+        "grid_coords": grid_coords,
+    },
+    SAVE_PATH,
+)
+print(f"Model saved to {SAVE_PATH}")

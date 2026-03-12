@@ -1,69 +1,145 @@
+"""
+3D Fourier Neural Operator (FNO) — Li et al. 2020
+===================================================
+Learns an operator mapping between function spaces by parameterizing
+the integral kernel directly in Fourier space.
+
+Architecture  (paper §3-4, Figure 1a):
+  1. Pointwise lifting   P :  in_channels  →  width   (nn.Linear)
+  2. N Fourier layers:   v_{t+1}(x) = 0( W·v_t(x) + K(φ)·v_t(x) )
+       K(φ) = F^{-1}( R_φ · F(v_t) )      (SpectralConv3d)
+       W    = 1x1x1 convolution             (nn.Conv3d, kernel=1)
+  3. Pointwise projection Q :  width  →  out_channels  (two nn.Linear layers)
+"""
+
 import torch
 import torch.nn as nn
-import numpy as np
+import torch.nn.functional as F
 
-class FourierFeatureTransform(nn.Module):
-    def __init__(self, in_features, mapping_size, scale=1.0):
-        super(FourierFeatureTransform, self).__init__()
-        
-        self.in_features = in_features
-        self.mapping_size = mapping_size
-        
-        # Initialize the random weight matrix B
-        B = torch.randn((in_features, mapping_size)) * scale
-        
-        self.register_buffer('B', B)
+
+# ---------------------------------------------------------------------------
+#  Core layer: 3-D Spectral Convolution  (Eq. 5-6 of the paper)
+# ---------------------------------------------------------------------------
+class SpectralConv3d(nn.Module):
+    """
+    Performs a linear transform on the truncated lower Fourier modes:
+        K(φ)v  =  F^{-1}( R_φ  ·  F(v) )
+
+    The 3-D real FFT stores only positive z-frequencies (Hermitian symmetry),
+    so for dimensions (x, y) we have four "corners" of low-frequency modes
+    (positive and negative), and for z only the positive side.
+    """
+
+    def __init__(self, in_channels, out_channels, modes1, modes2, modes3):
+        super().__init__()
+        self.in_channels  = in_channels
+        self.out_channels = out_channels
+        self.modes1 = modes1   # Fourier modes to keep in x
+        self.modes2 = modes2   # Fourier modes to keep in y
+        self.modes3 = modes3   # Fourier modes to keep in z
+
+        scale = 1.0 / (in_channels * out_channels)
+        shape = (in_channels, out_channels, modes1, modes2, modes3)
+
+        # Complex-valued learnable weight tensor R for each corner
+        self.w1 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
+        self.w2 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
+        self.w3 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
+        self.w4 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
+
+    @staticmethod
+    def _cmul(a, b):
+        """Batched complex matrix–vector multiply via einsum."""
+        return torch.einsum("bixyz,ioxyz->boxyz", a, b)
 
     def forward(self, x):
-        # x shape: (Batch, in_features)
-        # B shape: (in_features, mapping_size)
-        # Projection shape: (Batch, mapping_size)
-        x_proj = 2.0 * np.pi * x @ self.B
-        
-        # Output shape: (Batch, 2 * mapping_size)
-        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
-    
+        # x : (B, C_in, X, Y, Z)  — real-valued spatial field
+        sx, sy, sz = x.size(-3), x.size(-2), x.size(-1)
+        m1, m2, m3 = self.modes1, self.modes2, self.modes3
 
-class PINNModel(nn.Module):
-    def __init__(self, layers, fourier_mapping_size=32, fourier_scale=1.0, activation=nn.Tanh()):
-        super(PINNModel, self).__init__()
-        self.activation = activation
+        # 1. Forward 3-D real FFT  →  (B, C_in, X, Y, Z//2+1)  complex
+        x_ft = torch.fft.rfftn(x, dim=[-3, -2, -1])
 
-        #Fourier Transform Layer
-        self.fourier = FourierFeatureTransform(in_features=layers[0], 
-                                               mapping_size=fourier_mapping_size, 
-                                               scale=fourier_scale)
-        
-        # The output of Fourier layer
-        fourier_out_dim = fourier_mapping_size * 2
+        # 2. Allocate output in frequency domain (zeros = high modes filtered)
+        out_ft = torch.zeros(
+            x.size(0), self.out_channels, sx, sy, sz // 2 + 1,
+            dtype=torch.cfloat, device=x.device,
+        )
 
-        #Input Layer
-        self.input_layer = nn.Linear(fourier_out_dim, layers[1])
+        # 3. Multiply the four low-frequency corners by learnable weights
+        out_ft[:, :, :m1,  :m2,  :m3] = self._cmul(x_ft[:, :, :m1,  :m2,  :m3], self.w1)
+        out_ft[:, :, -m1:, :m2,  :m3] = self._cmul(x_ft[:, :, -m1:, :m2,  :m3], self.w2)
+        out_ft[:, :, :m1,  -m2:, :m3] = self._cmul(x_ft[:, :, :m1,  -m2:, :m3], self.w3)
+        out_ft[:, :, -m1:, -m2:, :m3] = self._cmul(x_ft[:, :, -m1:, -m2:, :m3], self.w4)
 
-        #Hidden Layers 
-        self.hidden_layers = nn.ModuleList()
-        for i in range(1, len(layers) - 2):
-            self.hidden_layers.append(nn.Linear(layers[i], layers[i + 1]))
-        
-        #Output Layer
-        self.output_layer = nn.Linear(layers[-2], layers[-1])
-        
-        #Viscosity
-        self.viscosity = nn.Parameter(torch.tensor([-5.65], dtype=torch.float32))
-    
+        # 4. Inverse real FFT back to spatial domain
+        return torch.fft.irfftn(out_ft, s=(sx, sy, sz))
+
+
+# ---------------------------------------------------------------------------
+#  Full model: 3-D Fourier Neural Operator
+# ---------------------------------------------------------------------------
+class FNO3d(nn.Module):
+    """
+    3-D Fourier Neural Operator for spatiotemporal PDE problems.
+
+    Args:
+        modes1/2/3 : number of Fourier modes kept per spatial dim (paper: 12 for 2-D)
+        width      : hidden channel dimension  dv  (paper: 32 for 2-D)
+        in_channels: input field channels  (e.g. vel(3)+pres(1)+mask(1)+coords(3) = 8)
+        out_channels: target field channels (e.g. vel(3)+pres(1) = 4)
+        num_layers : number of stacked Fourier layers (paper: 4)
+    """
+
+    def __init__(
+        self,
+        modes1=8,
+        modes2=8,
+        modes3=8,
+        width=32,
+        in_channels=8,
+        out_channels=4,
+        num_layers=4,
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+
+        # --- Lifting  P ---
+        self.lift = nn.Linear(in_channels, width)
+
+        # --- Fourier layers ---
+        self.spec_convs  = nn.ModuleList()
+        self.local_convs = nn.ModuleList()
+        for _ in range(num_layers):
+            self.spec_convs.append(
+                SpectralConv3d(width, width, modes1, modes2, modes3)
+            )
+            self.local_convs.append(nn.Conv3d(width, width, kernel_size=1))
+
+        # --- Projection  Q ---
+        self.proj1 = nn.Linear(width, 128)
+        self.proj2 = nn.Linear(128, out_channels)
+
     def forward(self, x):
-        # Pass raw coordinates through Fourier mapping
-        x_fourier = self.fourier(x)
-        
-        # Pass the Fourier features into the standard network
-        out = self.activation(self.input_layer(x_fourier))
-        
-        # Residual Blocks with Skip Connections
-        for layer in self.hidden_layers:
-            residual = out
-            out = self.activation(layer(out))
-            if out.shape == residual.shape:
-                out = out + residual 
-        
-        output = self.output_layer(out)
-        return output
+        """
+        x : (B, C_in, X, Y, Z)
+        returns : (B, C_out, X, Y, Z)
+        """
+        # Lifting  (pointwise across channels)
+        x = x.permute(0, 2, 3, 4, 1)       # → (B, X, Y, Z, C_in)
+        x = self.lift(x)
+        x = x.permute(0, 4, 1, 2, 3)       # → (B, width, X, Y, Z)
+
+        # Fourier layers
+        for i in range(self.num_layers):
+            x1 = self.spec_convs[i](x)      # global spectral conv  K(φ)
+            x2 = self.local_convs[i](x)     # local 1×1×1 conv      W
+            x  = x1 + x2
+            if i < self.num_layers - 1:
+                x = F.gelu(x)               # non-linearity (recovers high modes)
+
+        # Projection
+        x = x.permute(0, 2, 3, 4, 1)       # → (B, X, Y, Z, width)
+        x = F.gelu(self.proj1(x))
+        x = self.proj2(x)
+        return x.permute(0, 4, 1, 2, 3)    # → (B, C_out, X, Y, Z)
