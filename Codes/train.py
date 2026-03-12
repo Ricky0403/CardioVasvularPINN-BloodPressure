@@ -9,7 +9,7 @@ import time
 # Import custom modules
 from normalizer import MinMaxNormalizer
 from data_loader import DataLoader as PINN_DataLoader
-from model import PINNModel as PINN
+from Codes.model import PINNModel as PINN
 from physics_loss import get_physics_loss
 
 torch.set_float32_matmul_precision('high')
@@ -41,6 +41,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 data_path = r"../VelocityData3D" 
+#data_path = r"/kaggle/input/datasets/rickygeorgek/velocitydata3d" #kaggle
 raw_loader = PINN_DataLoader(data_path)
     
 num_files = len(raw_loader.files)
@@ -82,30 +83,47 @@ for key in scales:
 dataset = TensorDataset(X_norm, U_norm, P_norm)
 train_loader = DataLoader(dataset, batch_size=Batch_Size, shuffle=True)
 
-model = PINN(layers=[4, 64, 64, 64, 64, 64, 64, 64, 4], activation=nn.SiLU()).to(device)
+model = PINN(
+    layers=[4, 64, 64, 64, 64, 64, 64, 64, 4], 
+    fourier_mapping_size=32, 
+    fourier_scale=1.0,        
+    activation=nn.SiLU()
+).to(device)
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+# CHECKPOINT
+CHECKPOINT_PATH = os.path.join(save_dir, "pinn_checkpoint.pth")
+start_epoch = 0
+
+if os.path.exists(CHECKPOINT_PATH):
+    print(f"Found checkpoint at {CHECKPOINT_PATH}. Loading...")
+    checkpoint = torch.load(CHECKPOINT_PATH)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    start_epoch = checkpoint['epoch'] + 1
+    print(f"Resuming training from Epoch {start_epoch}")
+else:
+    print("No checkpoint found. Starting fresh.")
 
 print("Starting Training")
 start_time = time.time()
 running_time = start_time
-for epoch in range(Epoches):
+for epoch in range(start_epoch, Epoches):
     total_loss = 0
     data_loss_accum = 0
     phys_loss_accum = 0
 
     for batch_idx, (x_batch, u_batch, p_batch) in enumerate(train_loader):
-        x_batch = x_batch.clone().detach().requires_grad_(True)
-
+        x_batch = x_batch.clone().detach()
         optimizer.zero_grad()
 
         prediction = model(x_batch)
         u_pred = prediction[:, 0:3] 
 
+        # Calculate MSE Data Loss
         loss_data = F.mse_loss(u_pred, u_batch)
-            
-        loss_physics = get_physics_loss(model, x_batch, F.softplus(model.viscosity), scales)
-            
-        loss = loss_data + loss_physics
+        loss_physics = get_physics_loss(model, x_batch, prediction, F.softplus(model.viscosity), scales)
+        loss = loss_data  + loss_physics
             
         loss.backward()
         optimizer.step()
@@ -120,8 +138,8 @@ for epoch in range(Epoches):
         # Run a full forward pass on ALL data to check accuracy
         with torch.no_grad():
             full_pred = model(X_norm)
-            u_full_pred = full_pred[:, 0:3] # Predicted Velocity
-            p_full_pred = full_pred[:, 3:4] # Predicted Pressure
+            u_full_pred = full_pred[:, 0:3] 
+            p_full_pred = full_pred[:, 3:4] 
             
             # --- A. Training Accuracy (Velocity) ---
             _, train_acc = calculate_metrics(u_full_pred, U_norm)
@@ -142,6 +160,14 @@ for epoch in range(Epoches):
               f"Val Acc (P): {val_acc:.2f}% | "    
               f"Visc: {current_mu:.5f} | "
               f"Time: {elapsed:.1f}s")
+        
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': avg_total
+        }, CHECKPOINT_PATH)
+        print("Checkpoint saved.")
         
         running_time = time.time()
 
