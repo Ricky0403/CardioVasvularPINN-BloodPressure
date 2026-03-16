@@ -106,6 +106,13 @@ class FNODataLoader:
 
         fields = np.stack(all_fields, axis=0).astype(np.float32)  # (T, 4, res, res, res)
 
+        # Add a time channel: normalized [0, 1] over the cardiac cycle
+        T = fields.shape[0]
+        time_channel = np.linspace(0, 1, T, dtype=np.float32)  # (T,)
+        # Broadcast to (T, 1, res, res, res)
+        time_grid = time_channel[:, None, None, None, None] * np.ones((T, 1, res, res, res), dtype=np.float32)
+        fields = np.concatenate([fields, time_grid], axis=1)  # now (T, 5, res, res, res)
+
         # --- 6. Per-channel standardization (zero mean, unit var, inside vessel only) ---
         stats = {}
         for c in range(4):

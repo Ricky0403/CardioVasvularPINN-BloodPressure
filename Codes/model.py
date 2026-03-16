@@ -15,6 +15,7 @@ Architecture  (paper §3-4, Figure 1a):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +42,7 @@ class SpectralConv3d(nn.Module):
         scale = 1.0 / (in_channels * out_channels)
         shape = (in_channels, out_channels, modes1, modes2, modes3)
 
+        # Keep spectral weights in float32 always — FFT needs it
         # Complex-valued learnable weight tensor R for each corner
         self.w1 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
         self.w2 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
@@ -53,27 +55,27 @@ class SpectralConv3d(nn.Module):
         return torch.einsum("bixyz,ioxyz->boxyz", a, b)
 
     def forward(self, x):
-        # x : (B, C_in, X, Y, Z)  — real-valued spatial field
+        # FFT requires float32 — cast up, compute, cast back
+        orig_dtype = x.dtype
+        x = x.float()
+
         sx, sy, sz = x.size(-3), x.size(-2), x.size(-1)
         m1, m2, m3 = self.modes1, self.modes2, self.modes3
 
-        # 1. Forward 3-D real FFT  →  (B, C_in, X, Y, Z//2+1)  complex
         x_ft = torch.fft.rfftn(x, dim=[-3, -2, -1])
 
-        # 2. Allocate output in frequency domain (zeros = high modes filtered)
         out_ft = torch.zeros(
             x.size(0), self.out_channels, sx, sy, sz // 2 + 1,
             dtype=torch.cfloat, device=x.device,
         )
 
-        # 3. Multiply the four low-frequency corners by learnable weights
         out_ft[:, :, :m1,  :m2,  :m3] = self._cmul(x_ft[:, :, :m1,  :m2,  :m3], self.w1)
         out_ft[:, :, -m1:, :m2,  :m3] = self._cmul(x_ft[:, :, -m1:, :m2,  :m3], self.w2)
         out_ft[:, :, :m1,  -m2:, :m3] = self._cmul(x_ft[:, :, :m1,  -m2:, :m3], self.w3)
         out_ft[:, :, -m1:, -m2:, :m3] = self._cmul(x_ft[:, :, -m1:, -m2:, :m3], self.w4)
 
-        # 4. Inverse real FFT back to spatial domain
-        return torch.fft.irfftn(out_ft, s=(sx, sy, sz))
+        result = torch.fft.irfftn(out_ft, s=(sx, sy, sz))
+        return result.to(orig_dtype)  # cast back to bfloat16 for the rest of the network
 
 
 # ---------------------------------------------------------------------------
@@ -132,11 +134,14 @@ class FNO3d(nn.Module):
 
         # Fourier layers
         for i in range(self.num_layers):
-            x1 = self.spec_convs[i](x)      # global spectral conv  K(φ)
-            x2 = self.local_convs[i](x)     # local 1×1×1 conv      W
-            x  = x1 + x2
-            if i < self.num_layers - 1:
-                x = F.gelu(x)               # non-linearity (recovers high modes)
+            def layer_fn(x, i=i):
+                x1 = self.spec_convs[i](x)
+                x2 = self.local_convs[i](x)
+                x = x1 + x2
+                if i < self.num_layers - 1:
+                    x = F.gelu(x)
+                return x
+            x = checkpoint(layer_fn, x, use_reentrant=False)
 
         # Projection
         x = x.permute(0, 2, 3, 4, 1)       # → (B, X, Y, Z, width)
