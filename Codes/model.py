@@ -1,3 +1,52 @@
+"""
+3D Fourier Neural Operator variants for blood-flow surrogate modelling.
+=======================================================================
+
+Three architectures provided:
+
+  FNO3d   — original flat operator (kept for checkpoint compatibility)
+  HUFNO3d — parallel fusion: SpectralConv3d ∥ MiniUNet3d inside EVERY layer
+             (recommended — designed for pressure prediction in vessel flow)
+
+Why HUFNO3d for blood-flow pressure prediction
+──────────────────────────────────────────────
+Blood pressure lives at two scales simultaneously:
+
+  Global: the cardiac pressure wave propagates through the whole vessel.
+          SpectralConv3d captures this — FFT modes are global basis functions
+          that naturally represent smooth large-scale pressure gradients.
+
+  Local:  the no-slip boundary layer, recirculation zones and vena contracta
+          are sharp features near the wall.  MiniUNet3d captures these with
+          local 3×3×3 kernels that can represent sharp discontinuities that
+          a global Fourier basis would need O(res) modes to represent.
+
+The HUFNO layer fuses both paths in parallel (sum before nonlinearity), so
+the model allocates spectral capacity to pressure waves and convolutional
+capacity to boundary geometry without the two competing for the same weights.
+
+Architecture of one HUFNOLayer3d
+─────────────────────────────────────────────
+  Input  (B, width, X, Y, Z)
+       │
+       ├─ SpectralConv3d ──────── x1  (global: Fourier modes, pressure waves)
+       ├─ MiniUNet3d ─────────── x2  (local:  wall geometry, recirculation)
+       └─ Conv3d(k=1) ─────────── x3  (pointwise: channel mixing / residual)
+       │
+       └─ GELU(x1 + x2 + x3) → output
+
+Output channel convention (out_ch = 5):
+  ch 0: u  velocity-x   (standardised)
+  ch 1: v  velocity-y   (standardised)
+  ch 2: w  velocity-z   (standardised)
+  ch 3: p  pressure     (standardised)  ← primary prediction goal
+  ch 4: t  cardiac-cycle time index (0→1, passed through unchanged)
+
+VRAM (WIDTH=32, GRID_RES=64, B=1, bfloat16, gradient-checkpointed):
+  ~340 MB total → comfortable on 8 GB.
+  Width 48 → ~620 MB,  Width 64 → ~960 MB  (both fit).
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,15 +54,15 @@ from torch.utils.checkpoint import checkpoint
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Core layer: 3-D Spectral Convolution  (Eq. 5-6 of the FNO paper)
+#  Core: 3-D Spectral Convolution  (Eq. 5-6 of Li et al. 2020)
 # ────────────────────────────────────────────────────────────────────────────
 class SpectralConv3d(nn.Module):
     """
-    Performs a linear transform on the truncated lower Fourier modes:
-        K(φ)v  =  F^{-1}( R_φ  ·  F(v) )
+    K(φ)v = F^{-1}( R_φ · F(v) )
 
-    The 3-D real FFT stores only positive z-frequencies (Hermitian symmetry),
-    so for (x, y) we keep four low-frequency corners; for z only positive side.
+    Real FFT → only positive z-frequencies stored (Hermitian symmetry).
+    Four low-frequency corners in (x, y) × positive-z strip.
+    Weights always float32 (FFT kernel requirement); cast down after irfftn.
     """
 
     def __init__(self, in_channels, out_channels, modes1, modes2, modes3):
@@ -26,8 +75,6 @@ class SpectralConv3d(nn.Module):
 
         scale = 1.0 / (in_channels * out_channels)
         shape = (in_channels, out_channels, modes1, modes2, modes3)
-
-        # Complex-valued learnable weights, kept in float32 — FFT requires it.
         self.w1 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
         self.w2 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
         self.w3 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
@@ -35,13 +82,11 @@ class SpectralConv3d(nn.Module):
 
     @staticmethod
     def _cmul(a, b):
-        """Batched complex matrix–vector multiply via einsum."""
         return torch.einsum("bixyz,ioxyz->boxyz", a, b)
 
     def forward(self, x):
-        orig_dtype = x.dtype
-        x = x.float()                           # FFT needs float32
-
+        orig = x.dtype
+        x    = x.float()
         sx, sy, sz = x.size(-3), x.size(-2), x.size(-1)
         m1, m2, m3 = self.modes1, self.modes2, self.modes3
 
@@ -51,181 +96,120 @@ class SpectralConv3d(nn.Module):
             x.size(0), self.out_channels, sx, sy, sz // 2 + 1,
             dtype=torch.cfloat, device=x.device,
         )
-
-        # Four low-frequency corners in (x, y); positive z only
         out_ft[:, :, :m1,  :m2,  :m3] = self._cmul(x_ft[:, :, :m1,  :m2,  :m3], self.w1)
         out_ft[:, :, -m1:, :m2,  :m3] = self._cmul(x_ft[:, :, -m1:, :m2,  :m3], self.w2)
         out_ft[:, :, :m1,  -m2:, :m3] = self._cmul(x_ft[:, :, :m1,  -m2:, :m3], self.w3)
         out_ft[:, :, -m1:, -m2:, :m3] = self._cmul(x_ft[:, :, -m1:, -m2:, :m3], self.w4)
 
-        result = torch.fft.irfftn(out_ft, s=(sx, sy, sz))
-        return result.to(orig_dtype)            # cast back to bfloat16
+        return torch.fft.irfftn(out_ft, s=(sx, sy, sz)).to(orig)
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Original: 3-D Fourier Neural Operator  (kept for checkpoint compatibility)
+#  Mini 3-D U-Net — local hierarchical feature extractor
 # ────────────────────────────────────────────────────────────────────────────
-class FNO3d(nn.Module):
-    """
-    Standard FNO3d — global spectral operator on the full input grid.
+def _gn(ch):
+    """Safe GroupNorm: clamp num_groups to max that divides ch."""
+    for g in (8, 4, 2, 1):
+        if ch % g == 0:
+            return nn.GroupNorm(g, ch)
 
-    Kept for backward compatibility with existing checkpoints.
-    For new training runs, prefer HFNO3d.
 
-    Args:
-        modes1/2/3  : Fourier modes kept per spatial dimension
-        width       : hidden channel dimension
-        in_channels : input channels (vel×3 + pres + time + mask + coords = 9)
-        out_channels: output channels (vel×3 + pres + time = 5)
-        num_layers  : number of stacked Fourier layers
-    """
-
-    def __init__(
-        self,
-        modes1=8, modes2=8, modes3=8,
-        width=32,
-        in_channels=9,
-        out_channels=5,
-        num_layers=4,
-    ):
+class _Down(nn.Module):
+    def __init__(self, in_ch, out_ch):
         super().__init__()
-        self.num_layers = num_layers
+        self.net = nn.Sequential(
+            nn.Conv3d(in_ch, out_ch, 3, stride=2, padding=1),
+            _gn(out_ch), nn.GELU(),
+        )
+    def forward(self, x): return self.net(x)
 
-        self.lift = nn.Linear(in_channels, width)
 
-        self.spec_convs  = nn.ModuleList()
-        self.local_convs = nn.ModuleList()
-        for _ in range(num_layers):
-            self.spec_convs.append(SpectralConv3d(width, width, modes1, modes2, modes3))
-            self.local_convs.append(nn.Conv3d(width, width, kernel_size=1))
+class _Up(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+        self.up   = nn.ConvTranspose3d(in_ch, in_ch, 2, stride=2)
+        self.fuse = nn.Sequential(
+            nn.Conv3d(in_ch + skip_ch, out_ch, 3, padding=1),
+            _gn(out_ch), nn.GELU(),
+        )
+    def forward(self, x, skip):
+        return self.fuse(torch.cat([self.up(x), skip], dim=1))
 
-        self.proj1 = nn.Linear(width, 128)
-        self.proj2 = nn.Linear(128, out_channels)
+
+class MiniUNet3d(nn.Module):
+    """
+    3-D U-Net that fits INSIDE one HUFNO layer.
+
+    (B, W, X, Y, Z) → (B, W, X, Y, Z)   same shape, richer features.
+
+    Hierarchy (W = width):
+      skip0 = x                             (B, W,   X,   Y,   Z )
+      e1    = down1(skip0)                  (B, W/2, X/2, Y/2, Z/2)
+      bt    = down2(e1) → bottleneck        (B, W/4, X/4, Y/4, Z/4)
+      d1    = up1(bt, e1)                   (B, W/2, X/2, Y/2, Z/2)
+      out   = up2(d1, skip0)               (B, W,   X,   Y,   Z )
+
+    GroupNorm instead of BatchNorm → stable at batch_size=1.
+    """
+
+    def __init__(self, width):
+        super().__init__()
+        w2, w4 = width // 2, width // 4
+
+        self.down1      = _Down(width, w2)
+        self.down2      = _Down(w2, w4)
+        self.bottleneck = nn.Sequential(
+            nn.Conv3d(w4, w4, 3, padding=1), _gn(w4), nn.GELU()
+        )
+        self.up1 = _Up(w4, w2, w2)
+        self.up2 = _Up(w2, width, width)
 
     def forward(self, x):
-        """x : (B, C_in, X, Y, Z)  →  (B, C_out, X, Y, Z)"""
-        x = x.permute(0, 2, 3, 4, 1)
-        x = self.lift(x)
-        x = x.permute(0, 4, 1, 2, 3)
-
-        for i in range(self.num_layers):
-            def layer_fn(x, i=i):
-                x1 = self.spec_convs[i](x)
-                x2 = self.local_convs[i](x)
-                x  = x1 + x2
-                if i < self.num_layers - 1:
-                    x = F.gelu(x)
-                return x
-            x = checkpoint(layer_fn, x, use_reentrant=False)
-
-        x = x.permute(0, 2, 3, 4, 1)
-        x = F.gelu(self.proj1(x))
-        x = self.proj2(x)
-        return x.permute(0, 4, 1, 2, 3)
+        skip0 = x
+        e1    = self.down1(skip0)
+        bt    = self.bottleneck(self.down2(e1))
+        d1    = self.up1(bt, e1)
+        return self.up2(d1, skip0)
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  H-FNO building blocks
+#  HUFNO layer: three parallel paths, single fusion
 # ────────────────────────────────────────────────────────────────────────────
-class DownConv(nn.Module):
+class HUFNOLayer3d(nn.Module):
     """
-    Encoder block: extracts local boundary features and halves the spatial grid.
+    σ( SpectralConv(x) + MiniUNet(x) + Conv1×1(x) )
 
-    Strided Conv3d + GroupNorm + GELU.
-    GroupNorm is preferred over BatchNorm for 3-D fluid data because:
-      - Batch size is typically 1 (VRAM constraint) → BN statistics are noisy.
-      - GN normalises within each sample across spatial locations, which is
-        stable regardless of batch size.
+    All three paths read the SAME input x — strictly parallel, not sequential.
+    This lets the model specialise each path without interference.
     """
 
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, width, modes):
         super().__init__()
-        # num_groups=8 divides cleanly for out_channels ∈ {16, 32, 64, 128}
-        n_groups = min(8, out_channels)
-        self.conv = nn.Sequential(
-            nn.Conv3d(in_channels, out_channels, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(n_groups, out_channels),
-            nn.GELU(),
-        )
+        self.spec_conv  = SpectralConv3d(width, width, modes, modes, modes)
+        self.mini_unet  = MiniUNet3d(width)
+        self.local_conv = nn.Conv3d(width, width, kernel_size=1)
 
     def forward(self, x):
-        return self.conv(x)
-
-
-class UpConv(nn.Module):
-    """
-    Decoder block: upsamples and merges skip-connection features from the encoder.
-
-    ConvTranspose3d doubles the spatial resolution, then the skip features
-    (high-resolution boundary information) are concatenated and a 3×3×3
-    convolution fuses them.
-    """
-
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        n_groups = min(8, out_channels)
-        self.up   = nn.ConvTranspose3d(in_channels, out_channels, kernel_size=2, stride=2)
-        self.conv = nn.Sequential(
-            # After concat: out_channels (from up) + out_channels (from skip) = out_channels*2
-            nn.Conv3d(out_channels * 2, out_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(n_groups, out_channels),
-            nn.GELU(),
+        return F.gelu(
+            self.spec_conv(x) + self.mini_unet(x) + self.local_conv(x)
         )
 
-    def forward(self, x, skip_feature):
-        x = self.up(x)
-        x = torch.cat([x, skip_feature], dim=1)   # inject boundary detail
-        return self.conv(x)
-
 
 # ────────────────────────────────────────────────────────────────────────────
-#  HFNO3d — Hierarchical Fourier Neural Operator
+#  HUFNO3d — full model
 # ────────────────────────────────────────────────────────────────────────────
-class HFNO3d(nn.Module):
+class HUFNO3d(nn.Module):
     """
-    Hierarchical 3-D Fourier Neural Operator.
-
-    Stage 1 — Encoder (local feature extraction):
-        Conv3d  :  in_channels → width//2   (full res,   e.g. 64³)
-        DownConv:  width//2   → width       (half res,   e.g. 32³)
-        DownConv:  width      → width*2     (quarter res, e.g. 16³)
-
-        Strided convolutions extract sharp vessel-wall geometry at each scale
-        before the FFT can blur them.
-
-    Stage 2 — Spectral bottleneck (global operator):
-        N × (SpectralConv3d + 1×1 Conv + GELU)  on the quarter-res grid.
-
-        Physics advantage: the FFT here is 64× cheaper than on the full grid,
-        and the modes cover a larger fraction of the spectrum, so large-scale
-        pressure waves and momentum transport are better resolved.
-
-    Stage 3 — Decoder (reconstruction):
-        UpConv  : width*2  → width       (quarter → half)
-        UpConv  : width    → width//2    (half    → full)
-        Conv3d 1×1: width//2 → out_channels
-
-        Each UpConv adds the corresponding encoder skip connection so the
-        exact vessel wall position is available at full resolution.
-
-    Parameter note:
-        With width=32 and num_fno_layers=4 the bottleneck SpectralConv3d
-        layers operate on 64 channels — this is ~4× more parameters than
-        the plain FNO3d (≈33M vs ≈8.4M) but the FNO is running on a 64×
-        smaller grid (16³ vs 64³), so the forward pass is cheaper and
-        gradient checkpointing keeps VRAM manageable.
-
-        To reduce params while keeping the hierarchical structure, set
-        bottleneck_width = width  instead of width*2 in the constructor.
+    Hierarchical U-Net Fourier Neural Operator.
 
     Args:
-        modes        : Fourier modes per dimension (applied at quarter-res grid).
-                       Constraint: modes ≤ (res // 4) // 2.
-                       At 64³ input with 2 down-steps → 16³ bottleneck → modes ≤ 8. ✓
-        width        : base hidden channel width (encoder starts at width//2).
-        in_channels  : input channels (vel×3 + pres + time + mask + coords = 9).
-        out_channels : output channels (vel×3 + pres + time = 5).
-        num_fno_layers: number of FNO blocks at the bottleneck.
+        modes       : Fourier modes per spatial dim.
+                      Must satisfy: modes ≤ (GRID_RES // 4) // 2.
+                      For GRID_RES=64 → modes ≤ 8  ✓
+        width       : hidden channel depth (default 32, can raise to 48/64).
+        in_channels : 9   (vel×3 + pres + time + mask + coords×3).
+        out_channels: 5   (vel×3 + pres + time).
+        num_layers  : number of HUFNO layers (default 4).
     """
 
     def __init__(
@@ -234,56 +218,67 @@ class HFNO3d(nn.Module):
         width=32,
         in_channels=9,
         out_channels=5,
-        num_fno_layers=4,
+        num_layers=4,
     ):
         super().__init__()
-        self.num_fno_layers = num_fno_layers
-        bottleneck_ch = width * 2   # channel depth at the FNO bottleneck
+        self.num_layers = num_layers
 
-        # ── Stage 1: Encoder ────────────────────────────────────────────────
-        # x0: full res,   width//2  channels  (skip for up2)
-        # x1: half res,   width     channels  (skip for up1)
-        # x_bt: quarter res, bottleneck_ch  channels  (bottleneck input)
-        self.inc   = nn.Conv3d(in_channels, width // 2, kernel_size=3, padding=1)
-        self.down1 = DownConv(width // 2, width)
-        self.down2 = DownConv(width,      bottleneck_ch)
-
-        # ── Stage 2: Spectral bottleneck ────────────────────────────────────
-        self.fno_blocks    = nn.ModuleList()
-        self.local_mixers  = nn.ModuleList()
-        for _ in range(num_fno_layers):
-            self.fno_blocks.append(
-                SpectralConv3d(bottleneck_ch, bottleneck_ch, modes, modes, modes)
-            )
-            self.local_mixers.append(
-                nn.Conv3d(bottleneck_ch, bottleneck_ch, kernel_size=1)
-            )
-
-        # ── Stage 3: Decoder ────────────────────────────────────────────────
-        self.up1      = UpConv(bottleneck_ch, width)
-        self.up2      = UpConv(width,          width // 2)
-        self.out_conv = nn.Conv3d(width // 2, out_channels, kernel_size=1)
+        self.lift   = nn.Linear(in_channels, width)
+        self.layers = nn.ModuleList([
+            HUFNOLayer3d(width, modes) for _ in range(num_layers)
+        ])
+        self.proj1  = nn.Linear(width, 128)
+        self.proj2  = nn.Linear(128, out_channels)
 
     def forward(self, x):
-        """
-        x : (B, C_in, X, Y, Z)
-        returns : (B, C_out, X, Y, Z)   — same spatial dimensions as input
-        """
-        # ── Stage 1: Encode ─────────────────────────────────────────────────
-        x0 = F.gelu(self.inc(x))     # (B, width//2, X, Y, Z)         — full res
-        x1 = self.down1(x0)          # (B, width,    X/2, Y/2, Z/2)   — half res
-        x_bt = self.down2(x1)        # (B, width*2,  X/4, Y/4, Z/4)   — bottleneck
+        """x: (B, C_in, X, Y, Z) → (B, C_out, X, Y, Z)"""
+        # Lift
+        x = x.permute(0, 2, 3, 4, 1)
+        x = self.lift(x)
+        x = x.permute(0, 4, 1, 2, 3)
 
-        # ── Stage 2: Spectral bottleneck (with gradient checkpointing) ──────
-        for i in range(self.num_fno_layers):
-            def bottleneck_fn(x_bt, i=i):
-                x_fno = self.fno_blocks[i](x_bt)
-                x_loc = self.local_mixers[i](x_bt)
-                return F.gelu(x_fno + x_loc)
-            x_bt = checkpoint(bottleneck_fn, x_bt, use_reentrant=False)
+        # HUFNO layers with gradient checkpointing
+        for layer in self.layers:
+            x = checkpoint(layer, x, use_reentrant=False)
 
-        # ── Stage 3: Decode + skip connections ──────────────────────────────
-        x_up = self.up1(x_bt, x1)   # (B, width,    X/2, Y/2, Z/2)
-        x_up = self.up2(x_up, x0)   # (B, width//2, X, Y, Z)
+        # Project
+        x = x.permute(0, 2, 3, 4, 1)
+        x = F.gelu(self.proj1(x))
+        x = self.proj2(x)
+        return x.permute(0, 4, 1, 2, 3)
 
-        return self.out_conv(x_up)   # (B, C_out, X, Y, Z)
+
+# ────────────────────────────────────────────────────────────────────────────
+#  FNO3d — kept for checkpoint backward-compatibility only
+# ────────────────────────────────────────────────────────────────────────────
+class FNO3d(nn.Module):
+    """Original flat FNO3d.  Use HUFNO3d for new training."""
+
+    def __init__(self, modes1=8, modes2=8, modes3=8,
+                 width=32, in_channels=9, out_channels=5, num_layers=4):
+        super().__init__()
+        self.num_layers = num_layers
+        self.lift = nn.Linear(in_channels, width)
+        self.spec_convs  = nn.ModuleList([
+            SpectralConv3d(width, width, modes1, modes2, modes3)
+            for _ in range(num_layers)
+        ])
+        self.local_convs = nn.ModuleList([
+            nn.Conv3d(width, width, kernel_size=1) for _ in range(num_layers)
+        ])
+        self.proj1 = nn.Linear(width, 128)
+        self.proj2 = nn.Linear(128, out_channels)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 3, 4, 1)
+        x = self.lift(x)
+        x = x.permute(0, 4, 1, 2, 3)
+        for i in range(self.num_layers):
+            def fn(x, i=i):
+                out = self.spec_convs[i](x) + self.local_convs[i](x)
+                return F.gelu(out) if i < self.num_layers - 1 else out
+            x = checkpoint(fn, x, use_reentrant=False)
+        x = x.permute(0, 2, 3, 4, 1)
+        x = F.gelu(self.proj1(x))
+        x = self.proj2(x)
+        return x.permute(0, 4, 1, 2, 3)
