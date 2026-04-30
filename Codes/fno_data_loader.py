@@ -113,7 +113,7 @@ class FNODataLoader:
         time_grid = time_channel[:, None, None, None, None] * np.ones((T, 1, res, res, res), dtype=np.float32)
         fields = np.concatenate([fields, time_grid], axis=1)  # now (T, 5, res, res, res)
 
-        # --- 6. Per-channel standardization (zero mean, unit var, inside vessel only) ---
+        # --- 6. Per-channel standardization (vel + pressure only, NOT time channel) ---
         stats = {}
         for c in range(4):
             channel_vals = []
@@ -127,6 +127,8 @@ class FNODataLoader:
 
             fields[:, c] = (fields[:, c] - mean_c) / std_c
             fields[:, c] *= mask_3d[np.newaxis]     # re-zero outside
+
+        # Channel 4 (time) stays in [0, 1] — already normalized, no stats needed.
 
         # --- 7. Normalized coordinate grid [0, 1] ---
         span = p_max - p_min

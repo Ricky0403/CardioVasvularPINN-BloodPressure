@@ -1,15 +1,17 @@
 """
-3D Fourier Neural Operator (FNO) — Li et al. 2020
-===================================================
-Learns an operator mapping between function spaces by parameterizing
-the integral kernel directly in Fourier space.
+3-D U-ResNet (Multi-Scale Residual Learning) for Cardiovascular Flow
+=====================================================================
+Replaces the Fourier Neural Operator with a U-Net encoder-decoder
+architecture augmented with residual blocks at every scale.
 
-Architecture  (paper §3-4, Figure 1a):
-  1. Pointwise lifting   P :  in_channels  →  width   (nn.Linear)
-  2. N Fourier layers:   v_{t+1}(x) = 0( W·v_t(x) + K(φ)·v_t(x) )
-       K(φ) = F^{-1}( R_φ · F(v_t) )      (SpectralConv3d)
-       W    = 1x1x1 convolution             (nn.Conv3d, kernel=1)
-  3. Pointwise projection Q :  width  →  out_channels  (two nn.Linear layers)
+Architecture:
+  Encoder:    3 downsampling stages  (32³ → 16³ → 8³ → 4³)
+  Bottleneck: 2 ResBlocks at the coarsest scale
+  Decoder:    3 upsampling stages with skip connections (4³ → 8³ → 16³ → 32³)
+  Output:     Conv3d projection to target channels
+
+Each stage uses GroupNorm + GELU activation with residual connections.
+Gradient checkpointing is used to fit 8-step rollout in limited VRAM.
 """
 
 import torch
@@ -19,132 +21,177 @@ from torch.utils.checkpoint import checkpoint
 
 
 # ---------------------------------------------------------------------------
-#  Core layer: 3-D Spectral Convolution  (Eq. 5-6 of the paper)
+#  Building block: 3-D Residual Block
 # ---------------------------------------------------------------------------
-class SpectralConv3d(nn.Module):
+class ResBlock3d(nn.Module):
     """
-    Performs a linear transform on the truncated lower Fourier modes:
-        K(φ)v  =  F^{-1}( R_φ  ·  F(v) )
+    Pre-activation residual block:
+        x → GN → GELU → Conv3d → GN → GELU → Conv3d → + x
 
-    The 3-D real FFT stores only positive z-frequencies (Hermitian symmetry),
-    so for dimensions (x, y) we have four "corners" of low-frequency modes
-    (positive and negative), and for z only the positive side.
+    If in_channels != out_channels, a 1x1 projection is used on the skip path.
     """
 
-    def __init__(self, in_channels, out_channels, modes1, modes2, modes3):
+    def __init__(self, in_channels, out_channels=None, groups=8):
         super().__init__()
-        self.in_channels  = in_channels
-        self.out_channels = out_channels
-        self.modes1 = modes1   # Fourier modes to keep in x
-        self.modes2 = modes2   # Fourier modes to keep in y
-        self.modes3 = modes3   # Fourier modes to keep in z
+        out_channels = out_channels or in_channels
 
-        scale = 1.0 / (in_channels * out_channels)
-        shape = (in_channels, out_channels, modes1, modes2, modes3)
+        self.gn1 = nn.GroupNorm(min(groups, in_channels), in_channels)
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.gn2 = nn.GroupNorm(min(groups, out_channels), out_channels)
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1)
 
-        # Keep spectral weights in float32 always — FFT needs it
-        # Complex-valued learnable weight tensor R for each corner
-        self.w1 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
-        self.w2 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
-        self.w3 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
-        self.w4 = nn.Parameter(scale * torch.rand(*shape, dtype=torch.cfloat))
-
-    @staticmethod
-    def _cmul(a, b):
-        """Batched complex matrix–vector multiply via einsum."""
-        return torch.einsum("bixyz,ioxyz->boxyz", a, b)
-
-    def forward(self, x):
-        # FFT requires float32 — cast up, compute, cast back
-        orig_dtype = x.dtype
-        x = x.float()
-
-        sx, sy, sz = x.size(-3), x.size(-2), x.size(-1)
-        m1, m2, m3 = self.modes1, self.modes2, self.modes3
-
-        x_ft = torch.fft.rfftn(x, dim=[-3, -2, -1])
-
-        out_ft = torch.zeros(
-            x.size(0), self.out_channels, sx, sy, sz // 2 + 1,
-            dtype=torch.cfloat, device=x.device,
+        # Skip projection if channel count changes
+        self.skip = (
+            nn.Conv3d(in_channels, out_channels, kernel_size=1)
+            if in_channels != out_channels
+            else nn.Identity()
         )
 
-        out_ft[:, :, :m1,  :m2,  :m3] = self._cmul(x_ft[:, :, :m1,  :m2,  :m3], self.w1)
-        out_ft[:, :, -m1:, :m2,  :m3] = self._cmul(x_ft[:, :, -m1:, :m2,  :m3], self.w2)
-        out_ft[:, :, :m1,  -m2:, :m3] = self._cmul(x_ft[:, :, :m1,  -m2:, :m3], self.w3)
-        out_ft[:, :, -m1:, -m2:, :m3] = self._cmul(x_ft[:, :, -m1:, -m2:, :m3], self.w4)
-
-        result = torch.fft.irfftn(out_ft, s=(sx, sy, sz))
-        return result.to(orig_dtype)  # cast back to bfloat16 for the rest of the network
+    def forward(self, x):
+        residual = self.skip(x)
+        out = F.gelu(self.gn1(x))
+        out = self.conv1(out)
+        out = F.gelu(self.gn2(out))
+        out = self.conv2(out)
+        return out + residual
 
 
 # ---------------------------------------------------------------------------
-#  Full model: 3-D Fourier Neural Operator
+#  Encoder block: Downsample + 2 ResBlocks
 # ---------------------------------------------------------------------------
-class FNO3d(nn.Module):
+class DownBlock(nn.Module):
+    """Strided convolution for 2× downsampling, followed by residual blocks."""
+
+    def __init__(self, in_ch, out_ch, groups=8):
+        super().__init__()
+        self.down_conv = nn.Conv3d(in_ch, out_ch, kernel_size=3, stride=2, padding=1)
+        self.gn = nn.GroupNorm(min(groups, out_ch), out_ch)
+        self.res1 = ResBlock3d(out_ch, groups=groups)
+        self.res2 = ResBlock3d(out_ch, groups=groups)
+
+    def forward(self, x):
+        x = F.gelu(self.gn(self.down_conv(x)))
+        x = self.res1(x)
+        x = self.res2(x)
+        return x
+
+
+# ---------------------------------------------------------------------------
+#  Decoder block: Upsample + Concatenate skip + 2 ResBlocks
+# ---------------------------------------------------------------------------
+class UpBlock(nn.Module):
+    """Transposed convolution for 2× upsampling with skip connection."""
+
+    def __init__(self, in_ch, skip_ch, out_ch, groups=8):
+        super().__init__()
+        self.up = nn.ConvTranspose3d(in_ch, in_ch, kernel_size=2, stride=2)
+        self.fuse = nn.Conv3d(in_ch + skip_ch, out_ch, kernel_size=3, padding=1)
+        self.gn = nn.GroupNorm(min(groups, out_ch), out_ch)
+        self.res1 = ResBlock3d(out_ch, groups=groups)
+        self.res2 = ResBlock3d(out_ch, groups=groups)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        # Handle potential size mismatch from odd dimensions
+        if x.shape != skip.shape:
+            x = F.interpolate(x, size=skip.shape[2:], mode='trilinear', align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        x = F.gelu(self.gn(self.fuse(x)))
+        x = self.res1(x)
+        x = self.res2(x)
+        return x
+
+
+# ---------------------------------------------------------------------------
+#  Full model: 3-D U-ResNet
+# ---------------------------------------------------------------------------
+class UResNet3d(nn.Module):
     """
-    3-D Fourier Neural Operator for spatiotemporal PDE problems.
+    3-D U-Net with Residual Blocks for spatiotemporal PDE problems.
+
+    Resolution path (for 32³ input):
+        Encoder:  32³ → 16³ → 8³ → 4³
+        Decoder:  4³ → 8³ → 16³ → 32³
 
     Args:
-        modes1/2/3 : number of Fourier modes kept per spatial dim (paper: 12 for 2-D)
-        width      : hidden channel dimension  dv  (paper: 32 for 2-D)
-        in_channels: input field channels  (e.g. vel(3)+pres(1)+mask(1)+coords(3) = 8)
-        out_channels: target field channels (e.g. vel(3)+pres(1) = 4)
-        num_layers : number of stacked Fourier layers (paper: 4)
+        in_channels:  input field channels (e.g. vel(3)+pres(1)+time(1)+mask(1)+coords(3) = 9)
+        out_channels: target field channels (e.g. vel(3)+pres(1)+time(1) = 5)
+        base_width:   channel count at the first encoder level; doubles at each stage
+        groups:       number of groups for GroupNorm
+        use_checkpoint: use gradient checkpointing to reduce VRAM usage
     """
 
     def __init__(
         self,
-        modes1=8,
-        modes2=8,
-        modes3=8,
-        width=32,
-        in_channels=8,
-        out_channels=4,
-        num_layers=4,
+        in_channels=9,
+        out_channels=5,
+        base_width=32,
+        groups=8,
+        use_checkpoint=True,
     ):
         super().__init__()
-        self.num_layers = num_layers
+        self.use_checkpoint = use_checkpoint
+        w = base_width
 
-        # --- Lifting  P ---
-        self.lift = nn.Linear(in_channels, width)
+        # --- Encoder ---
+        # Initial feature extraction at full resolution
+        self.enc0 = nn.Sequential(
+            nn.Conv3d(in_channels, w, kernel_size=3, padding=1),
+            nn.GroupNorm(min(groups, w), w),
+            nn.GELU(),
+            ResBlock3d(w, groups=groups),
+            ResBlock3d(w, groups=groups),
+        )
+        self.down1 = DownBlock(w, w * 2, groups=groups)       # 32³ → 16³
+        self.down2 = DownBlock(w * 2, w * 4, groups=groups)   # 16³ → 8³
+        self.down3 = DownBlock(w * 4, w * 8, groups=groups)   # 8³  → 4³
 
-        # --- Fourier layers ---
-        self.spec_convs  = nn.ModuleList()
-        self.local_convs = nn.ModuleList()
-        for _ in range(num_layers):
-            self.spec_convs.append(
-                SpectralConv3d(width, width, modes1, modes2, modes3)
-            )
-            self.local_convs.append(nn.Conv3d(width, width, kernel_size=1))
+        # --- Bottleneck ---
+        self.bottleneck = nn.Sequential(
+            ResBlock3d(w * 8, groups=groups),
+            ResBlock3d(w * 8, groups=groups),
+        )
 
-        # --- Projection  Q ---
-        self.proj1 = nn.Linear(width, 128)
-        self.proj2 = nn.Linear(128, out_channels)
+        # --- Decoder ---
+        self.up3 = UpBlock(w * 8, w * 4, w * 4, groups=groups)   # 4³  → 8³
+        self.up2 = UpBlock(w * 4, w * 2, w * 2, groups=groups)   # 8³  → 16³
+        self.up1 = UpBlock(w * 2, w,     w,     groups=groups)   # 16³ → 32³
+
+        # --- Output projection ---
+        self.out_conv = nn.Sequential(
+            nn.Conv3d(w, w, kernel_size=3, padding=1),
+            nn.GroupNorm(min(groups, w), w),
+            nn.GELU(),
+            nn.Conv3d(w, out_channels, kernel_size=1),
+        )
+
+    def _encoder(self, x):
+        e0 = self.enc0(x)
+        e1 = self.down1(e0)
+        e2 = self.down2(e1)
+        e3 = self.down3(e2)
+        return e0, e1, e2, e3
+
+    def _bottleneck(self, e3):
+        return self.bottleneck(e3)
+
+    def _decoder(self, b, e0, e1, e2):
+        d2 = self.up3(b, e2)
+        d1 = self.up2(d2, e1)
+        d0 = self.up1(d1, e0)
+        return self.out_conv(d0)
 
     def forward(self, x):
         """
         x : (B, C_in, X, Y, Z)
         returns : (B, C_out, X, Y, Z)
         """
-        # Lifting  (pointwise across channels)
-        x = x.permute(0, 2, 3, 4, 1)       # → (B, X, Y, Z, C_in)
-        x = self.lift(x)
-        x = x.permute(0, 4, 1, 2, 3)       # → (B, width, X, Y, Z)
-
-        # Fourier layers
-        for i in range(self.num_layers):
-            def layer_fn(x, i=i):
-                x1 = self.spec_convs[i](x)
-                x2 = self.local_convs[i](x)
-                x = x1 + x2
-                if i < self.num_layers - 1:
-                    x = F.gelu(x)
-                return x
-            x = checkpoint(layer_fn, x, use_reentrant=False)
-
-        # Projection
-        x = x.permute(0, 2, 3, 4, 1)       # → (B, X, Y, Z, width)
-        x = F.gelu(self.proj1(x))
-        x = self.proj2(x)
-        return x.permute(0, 4, 1, 2, 3)    # → (B, C_out, X, Y, Z)
+        if self.use_checkpoint and self.training:
+            e0, e1, e2, e3 = checkpoint(self._encoder, x, use_reentrant=False)
+            b = checkpoint(self._bottleneck, e3, use_reentrant=False)
+            out = checkpoint(self._decoder, b, e0, e1, e2, use_reentrant=False)
+        else:
+            e0, e1, e2, e3 = self._encoder(x)
+            b = self._bottleneck(e3)
+            out = self._decoder(b, e0, e1, e2)
+        return out
