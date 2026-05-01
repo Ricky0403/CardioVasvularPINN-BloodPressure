@@ -55,6 +55,7 @@ current = fields[0].unsqueeze(0).to(device)
 max_err = 0.0
 acc_list = []
 pres_list = []
+T_total = len(fields)
 with torch.no_grad():
     for s in range(len(fields) - 1):
         inp = torch.cat([
@@ -63,6 +64,8 @@ with torch.no_grad():
             grid_coords,
         ], dim=0).unsqueeze(0)
         current = model(inp)
+        # FIX: overwrite predicted time channel with ground-truth time
+        current[:, 4:5] = float(s + 1) / max(1, T_total - 1)
         tgt = fields[s + 1].unsqueeze(0).to(device)
 
         # Overall error

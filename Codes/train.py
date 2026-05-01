@@ -1,13 +1,11 @@
 """
 Training script for the 3-D Fourier Neural Operator (FNO).
-
-Paradigm shift from the original PINN training:
-  - PINN:  maps single point (x,y,z,t) → (u,v,w,p)       (point-wise)
-  - FNO:   maps entire 3-D field at time t → field at t+Δt (operator)
-
-The network is trained with pure supervised MSE loss on voxelized fields.
-No physics loss (autograd derivatives) is needed — the spectral convolutions
-in Fourier space capture the PDE dynamics directly from data.
+FIXED VERSION:
+  - Single optimizer (no gradient interference)
+  - Physics loss computed in float32 (fixes zero phys loss)
+  - Time channel handled correctly in rollout
+  - LR schedule fixed for 22000 epochs
+  - retain_graph removed
 """
 
 import os
@@ -28,23 +26,23 @@ torch.set_float32_matmul_precision("high")
 def fd_physics_loss(pred, mask_dev, dx=1.0):
     """
     Finite-difference continuity (divergence-free) loss.
-    Only applied at interior vessel voxels with valid neighbors.
+    FIXED: Cast to float32 explicitly so bfloat16 underflow doesn't zero this out.
     """
+    pred = pred.float()  # FIX: force float32
+    mask_f = mask_dev.float()
+
     u = pred[:, 0:1]
     v = pred[:, 1:2]
     w = pred[:, 2:3]
 
-    # One-sided differences at interior points (avoids wrap-around artifacts)
     du_dx = (u[:, :, 1:, :, :] - u[:, :, :-1, :, :]) / dx
     dv_dy = (v[:, :, :, 1:, :] - v[:, :, :, :-1, :]) / dx
     dw_dz = (w[:, :, :, :, 1:] - w[:, :, :, :, :-1]) / dx
 
-    # Trim mask to match the smaller tensor sizes
-    mask_x = mask_dev[:, :, 1:, :, :] * mask_dev[:, :, :-1, :, :]
-    mask_y = mask_dev[:, :, :, 1:, :] * mask_dev[:, :, :, :-1, :]
-    mask_z = mask_dev[:, :, :, :, 1:] * mask_dev[:, :, :, :, :-1]
+    mask_x = mask_f[:, :, 1:, :, :] * mask_f[:, :, :-1, :, :]
+    mask_y = mask_f[:, :, :, 1:, :] * mask_f[:, :, :, :-1, :]
+    mask_z = mask_f[:, :, :, :, 1:] * mask_f[:, :, :, :, :-1]
 
-    # Divergence on the trimmed interior
     min_x = min(du_dx.shape[2], dv_dy.shape[2], dw_dz.shape[2])
     min_y = min(du_dx.shape[3], dv_dy.shape[3], dw_dz.shape[3])
     min_z = min(du_dx.shape[4], dv_dy.shape[4], dw_dz.shape[4])
@@ -62,34 +60,59 @@ def fd_physics_loss(pred, mask_dev, dx=1.0):
 
 
 def bc_loss(pred, wall_mask_dev):
+    pred = pred.float()  # FIX: force float32
     vel_at_wall = pred[:, :3] * wall_mask_dev.float()
     return torch.mean(vel_at_wall ** 2)
+
+
+def pressure_stability_loss(pred, mask_dev):
+    pred = pred.float()  # FIX: force float32
+    p = pred[:, 3:4]
+    mask_f = mask_dev.float()
+    dp_dx = (p[:, :, 1:, :, :] - p[:, :, :-1, :, :])
+    dp_dy = (p[:, :, :, 1:, :] - p[:, :, :, :-1, :])
+    dp_dz = (p[:, :, :, :, 1:] - p[:, :, :, :, :-1])
+    loss = (
+        (dp_dx ** 2 * mask_f[:, :, 1:, :, :]).mean() +
+        (dp_dy ** 2 * mask_f[:, :, :, 1:, :]).mean() +
+        (dp_dz ** 2 * mask_f[:, :, :, :, 1:]).mean()
+    )
+    return loss
+
+
+def smoothness_loss(pred, prev_field, mask_dev):
+    pred = pred.float()
+    prev_field = prev_field.float()
+    diff = (pred[:, :4] - prev_field[:, :4]) * mask_dev.float()
+    return torch.mean(diff ** 2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
-GRID_RES   = 32        # back to 32; at 4GB this is the realistic ceiling
-MODES      = 8         # back to 8
-WIDTH      = 32        # back to 32; width=64 alone uses ~4x the activation memory
+GRID_RES   = 32
+MODES      = 8
+WIDTH      = 32
 NUM_LAYERS = 4
 
-BATCH_SIZE = 1         # must be 1 for 8-step rollout on 4GB
+BATCH_SIZE    = 1
 ROLLOUT_STEPS = 8
-EPOCHS = 22000
-LR = 1e-5                # very low — just nudging, not retraining
-LR_STEP    = 100       # Halve the LR every LR_STEP epochs (paper: 100)
-LR_GAMMA   = 0.5
-WEIGHT_DECAY = 1e-4
-NOISE_STD  = 0.01      # Gaussian noise injected into inputs (regularization)
-PHYS_RAMP_START = 0      # ramp is already complete by epoch 12901
-PHYS_RAMP_END   = 400    # so lambda will be max from epoch 1 of resume
-LAMBDA_PHYS_MAX = 0.05
-LAMBDA_BC_MAX   = 0.02
+EPOCHS        = 22000
+LR            = 3e-4        # FIX: higher initial LR — cosine will decay it properly
+LR_MIN        = 1e-6
+WEIGHT_DECAY  = 1e-4
+NOISE_STD     = 0.01
 
-DATA_PATH  = "../VelocityData3D"
-WALL_PATH  = "../VelocityData3D/WallMesh/wall.vtp"
-SAVE_DIR   = "../Models"
+# Physics loss config — FIX: ramp over first 2000 epochs
+PHYS_RAMP_START  = 200
+PHYS_RAMP_END    = 2000
+LAMBDA_PHYS_MAX  = 0.05
+LAMBDA_BC_MAX    = 0.02
+LAMBDA_PRES_STAB = 0.02     # FIX: was 0.05, reduced to not dominate
+
+DATA_PATH = "../VelocityData3D"
+WALL_PATH = "../VelocityData3D/WallMesh/wall.vtp"
+SAVE_DIR  = "../Models"
 
 CHECKPOINT_PATH = os.path.join(SAVE_DIR, "fno_checkpoint.pth")
 SAVE_PATH       = os.path.join(SAVE_DIR, "fno_model.pth")
@@ -109,14 +132,9 @@ del loader
 import gc; gc.collect()
 torch.cuda.empty_cache()
 
-# Keep fields, mask, grid_coords on CPU — DataLoader will move batches to GPU
 fields      = fields.cpu()
 mask        = mask.cpu()
 grid_coords = grid_coords.cpu()
-
-# fields      : (T, 4, res, res, res)  — standardized velocity(3) + pressure(1)
-# mask        : (res, res, res)         — binary vessel mask
-# grid_coords : (3, res, res, res)      — normalised spatial coordinates [0,1]
 
 T = fields.shape[0]
 val_split = int(0.8 * T)
@@ -126,7 +144,7 @@ print(f"Total timesteps: {T}, training pairs: {val_split - ROLLOUT_STEPS}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  2. DATASET  — consecutive timestep pairs
+#  2. DATASET
 # ═══════════════════════════════════════════════════════════════════════════
 class TimeStepDataset(Dataset):
     def __init__(self, fields, mask, coords, rollout_steps=ROLLOUT_STEPS, noise_std=0.0):
@@ -142,19 +160,15 @@ class TimeStepDataset(Dataset):
         return self.n_pairs
 
     def __getitem__(self, idx):
-        # Return a sequence of rollout_steps consecutive targets
         field_in = self.fields[idx]
         if self.training_mode:
-            # 1. Gaussian noise on velocity only
             if self.noise_std > 0:
                 noise = self.noise_std * torch.randn_like(field_in[:4])
                 field_in = field_in.clone()
                 field_in[:4] = field_in[:4] + noise * self.mask_ch
-
-            # 2. Random temporal reversal (flow can run backwards)
             if torch.rand(1).item() < 0.3:
                 field_in = field_in.clone()
-                field_in[:3] = -field_in[:3]   # flip velocity sign
+                field_in[:3] = -field_in[:3]
 
         inp = torch.cat([field_in, self.mask_ch, self.coords], dim=0)
         targets = self.fields[idx + 1 : idx + 1 + self.rollout_steps]
@@ -163,38 +177,22 @@ class TimeStepDataset(Dataset):
 
 def build_loaders(rollout_steps):
     train_ds = TimeStepDataset(
-        train_fields,
-        mask,
-        grid_coords,
-        rollout_steps=rollout_steps,
-        noise_std=NOISE_STD,
+        train_fields, mask, grid_coords,
+        rollout_steps=rollout_steps, noise_std=NOISE_STD,
     )
-    train_dl = DataLoader(
-        train_ds,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        pin_memory=False,
-    )
+    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, pin_memory=False)
     val_ds = TimeStepDataset(
-        val_fields,
-        mask,
-        grid_coords,
-        rollout_steps=rollout_steps,
-        noise_std=0.0,
+        val_fields, mask, grid_coords,
+        rollout_steps=rollout_steps, noise_std=0.0,
     )
-    val_dl = DataLoader(
-        val_ds,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        pin_memory=False,
-    )
+    val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, pin_memory=False)
     return train_ds, train_dl, val_ds, val_dl
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  3. MODEL, OPTIMIZER, SCHEDULER
 # ═══════════════════════════════════════════════════════════════════════════
-in_ch  = 5 + 1 + 3   # field(5: vel+pres+time) + mask + coords
+in_ch  = 5 + 1 + 3   # field(5) + mask(1) + coords(3)
 out_ch = 5
 
 model = FNO3d(
@@ -205,17 +203,15 @@ model = FNO3d(
     num_layers=NUM_LAYERS,
 ).to(device)
 
-# model = torch.compile(model)
-
 n_params = sum(p.numel() for p in model.parameters())
 print(f"FNO3d — {n_params:,} parameters")
 
-optimizer_data = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-optimizer_phys = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+# FIX: Single optimizer — eliminates gradient interference
+optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+# FIX: CosineAnnealingLR over full training duration
 scheduler = optim.lr_scheduler.CosineAnnealingLR(
-    optimizer_data,
-    T_max=2000,
-    eta_min=1e-6,
+    optimizer, T_max=EPOCHS, eta_min=LR_MIN,
 )
 
 
@@ -227,82 +223,61 @@ if os.path.exists(CHECKPOINT_PATH):
     print(f"Loading checkpoint: {CHECKPOINT_PATH}")
     ckpt = torch.load(CHECKPOINT_PATH, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
-    if "optimizer_data_state_dict" in ckpt and "optimizer_phys_state_dict" in ckpt:
-        optimizer_data.load_state_dict(ckpt["optimizer_data_state_dict"])
-        optimizer_phys.load_state_dict(ckpt["optimizer_phys_state_dict"])
-    elif "optimizer_state_dict" in ckpt:
-        optimizer_data.load_state_dict(ckpt["optimizer_state_dict"])
-        optimizer_phys.load_state_dict(ckpt["optimizer_state_dict"])
-    start_epoch = ckpt["epoch"] + 1
 
-    resume_lr = 5e-6
-    for param_group in optimizer_data.param_groups:
-        param_group["lr"] = resume_lr
-        param_group["initial_lr"] = resume_lr
-    for param_group in optimizer_phys.param_groups:
-        param_group["lr"] = 1e-6
-        param_group["initial_lr"] = 1e-6
+    # Load whichever optimizer key exists
+    for key in ("optimizer_state_dict", "optimizer_data_state_dict"):
+        if key in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt[key])
+            except Exception:
+                print(f"  Could not load optimizer state from '{key}', resetting.")
+            break
+
+    start_epoch = ckpt.get("epoch", 0) + 1
+
+    # Reset LR to a sane resume value
+    resume_lr = 5e-5
+    for pg in optimizer.param_groups:
+        pg["lr"] = resume_lr
+        pg["initial_lr"] = resume_lr
 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer_data,
-        T_max=3000,
-        eta_min=1e-7,
+        optimizer, T_max=max(1, EPOCHS - start_epoch), eta_min=LR_MIN,
     )
-    dataset, train_loader, val_dataset, val_loader = build_loaders(ROLLOUT_STEPS)
     print(f"Resuming from epoch {start_epoch}, LR reset to {resume_lr}")
 else:
-    dataset, train_loader, val_dataset, val_loader = build_loaders(ROLLOUT_STEPS)
     print("No checkpoint found — starting fresh.")
 
+dataset, train_loader, val_dataset, val_loader = build_loaders(ROLLOUT_STEPS)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  5. HELPER METRICS
+#  5. HELPER METRICS & MASKS
 # ═══════════════════════════════════════════════════════════════════════════
-mask_dev = mask.unsqueeze(0).unsqueeze(0).to(device)   # (1, 1, res, res, res)
+mask_dev = mask.unsqueeze(0).unsqueeze(0).to(device)   # (1,1,res,res,res)
 from torch.nn.functional import max_pool3d
-_not_mask = (~mask.bool()).float().unsqueeze(0).unsqueeze(0).to(device)
-_dilated  = max_pool3d(_not_mask, kernel_size=3, stride=1, padding=1)
+_not_mask    = (~mask.bool()).float().unsqueeze(0).unsqueeze(0).to(device)
+_dilated     = max_pool3d(_not_mask, kernel_size=3, stride=1, padding=1)
 wall_mask_dev = (mask_dev.float() * _dilated).bool()
 print(f"Wall voxels: {wall_mask_dev.sum().item()}")
 
+grid_coords_dev = grid_coords.to(device)
+
 
 def masked_mse(pred, target):
-    """MSE loss inside the vessel only."""
-    sq = (pred - target) ** 2 * mask_dev
+    sq = (pred - target).float() ** 2 * mask_dev.float()
     return sq.sum() / (mask_dev.sum() * pred.shape[1])
 
 
 @torch.no_grad()
 def masked_rel_l2(pred, target):
-    """Relative L2 error inside the vessel."""
-    d = (pred - target) * mask_dev
-    t = target * mask_dev
+    d = (pred - target).float() * mask_dev.float()
+    t = target.float() * mask_dev.float()
     return torch.sqrt((d ** 2).sum() / ((t ** 2).sum() + 1e-8))
 
 
 def build_input(field_t):
-    """Construct a single FNO input from a field tensor."""
     return torch.cat([field_t, mask.unsqueeze(0), grid_coords], dim=0).unsqueeze(0)
-
-
-def pressure_stability_loss(pred, mask_dev):
-    """Penalize large pressure spatial gradients."""
-    p = pred[:, 3:4]
-    dp_dx = (p[:, :, 1:, :, :] - p[:, :, :-1, :, :])
-    dp_dy = (p[:, :, :, 1:, :] - p[:, :, :, :-1, :])
-    dp_dz = (p[:, :, :, :, 1:] - p[:, :, :, :, :-1])
-    loss = (
-        (dp_dx ** 2 * mask_dev[:, :, 1:, :, :]).mean() +
-        (dp_dy ** 2 * mask_dev[:, :, :, 1:, :]).mean() +
-        (dp_dz ** 2 * mask_dev[:, :, :, :, 1:]).mean()
-    )
-    return loss
-
-
-def smoothness_loss(pred, prev_field, mask_dev):
-    """Penalize large changes between consecutive predictions."""
-    diff = (pred[:, :4] - prev_field[:, :4]) * mask_dev  # only vel+pres channels
-    return torch.mean(diff ** 2)
 
 
 def get_grad_norm(model):
@@ -313,149 +288,142 @@ def get_grad_norm(model):
     return total ** 0.5
 
 
+def make_next_input(pred_field, step_idx, total_steps, batch_size):
+    """
+    FIX: Replace the time channel in the predicted output with the correct
+    ground-truth normalized time before feeding back into the model.
+    pred_field: (B, 5, res, res, res) — model output
+    Returns:    (B, 9, res, res, res) — next model input
+    """
+    res = pred_field.shape[-1]
+    # Overwrite channel 4 (time) with correct normalized time
+    t_val = float(step_idx) / max(1, total_steps - 1)
+    pred_corrected = pred_field.clone()
+    pred_corrected[:, 4:5] = t_val  # broadcast scalar
+
+    return torch.cat([
+        pred_corrected,
+        mask_dev.expand(batch_size, -1, -1, -1, -1),
+        grid_coords_dev.unsqueeze(0).expand(batch_size, -1, -1, -1, -1),
+    ], dim=1)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  6. TRAINING LOOP
 # ═══════════════════════════════════════════════════════════════════════════
 print("\n--- Starting FNO Training ---")
-t_start = time.time()
-t_epoch = t_start
-grid_coords_dev = grid_coords.unsqueeze(0).to(device)
-mask_inp_dev = mask_dev.to(device)
-epoch_phys_avg = 1.0   # initialize high so lambda starts pushing
-PHYS_TARGET = 0.20     # aim to get physics loss below this
-lambda_phys = 0.0
-lambda_bc = 0.0
+t_start  = time.time()
+t_epoch  = t_start
 best_val_loss = float('inf')
-step_weights = [1.0, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.5]
+
+# FIX: uniform step weights early on, increase weight on later steps gradually
+step_weights_base = [1.0, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6]
 
 for epoch in range(start_epoch, EPOCHS):
     model.train()
     dataset.training_mode = True
-    epoch_loss = 0.0
-    epoch_mse = 0.0
-    epoch_phys = 0.0
-    epoch_bc = 0.0
-    grad_norm_data = 0.0
-    grad_norm_phys = 0.0
 
-    progress = max(0.0, min(1.0, (epoch - PHYS_RAMP_START) / (PHYS_RAMP_END - PHYS_RAMP_START)))
+    epoch_loss  = 0.0
+    epoch_mse   = 0.0
+    epoch_phys  = 0.0
+    epoch_bc    = 0.0
+    grad_norm_v = 0.0
 
-    if epoch > 0 and epoch % 50 == 0:
-        if epoch_phys_avg > PHYS_TARGET * 2:      # physics too bad
-            lambda_phys = min(lambda_phys * 1.10, LAMBDA_PHYS_MAX)
-            lambda_bc = min(lambda_bc * 1.10, LAMBDA_BC_MAX)
-        elif epoch_phys_avg < PHYS_TARGET:         # physics good — relax
-            lambda_phys = max(lambda_phys * 0.95, 0.01)
-            lambda_bc = max(lambda_bc * 0.95, 0.005)
-    else:
+    # Physics lambda ramp
+    if epoch < PHYS_RAMP_START:
+        lambda_phys = 0.0
+        lambda_bc   = 0.0
+    elif epoch < PHYS_RAMP_END:
+        progress    = (epoch - PHYS_RAMP_START) / (PHYS_RAMP_END - PHYS_RAMP_START)
         lambda_phys = LAMBDA_PHYS_MAX * progress
-        lambda_bc = LAMBDA_BC_MAX * progress
+        lambda_bc   = LAMBDA_BC_MAX * progress
+    else:
+        lambda_phys = LAMBDA_PHYS_MAX
+        lambda_bc   = LAMBDA_BC_MAX
 
     for inp, tgts in train_loader:
         inp  = inp.to(device)
         tgts = tgts.to(device)
 
-        optimizer_data.zero_grad()
-        loss_data_total = 0.0
-        current_data = inp
-        prev_pred_data = None
+        optimizer.zero_grad()
 
+        total_loss    = torch.tensor(0.0, device=device)
+        current       = inp
+        prev_pred     = None
+        batch_size    = inp.shape[0]
+
+        # ── Combined forward pass (data + physics in one graph) ────────────
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             for s in range(dataset.rollout_steps):
-                pred = model(current_data)
+                pred  = model(current)
                 tgt_s = tgts[:, s]
 
-                mse_unweighted = masked_mse(pred, tgt_s)
-                loss_data = mse_unweighted * step_weights[s]
-                epoch_mse += mse_unweighted.item()
+                # Data loss (MSE)
+                mse_s      = masked_mse(pred, tgt_s)
+                w_s        = step_weights_base[s]
+                loss_s     = mse_s * w_s
+                epoch_mse += mse_s.item()
 
-                if s > 0 and prev_pred_data is not None:
-                    loss_smooth = smoothness_loss(pred, prev_pred_data, mask_dev)
-                    loss_data = loss_data + 0.01 * loss_smooth  # small weight — just regularization
-                prev_pred_data = pred
+                # Smoothness regularization
+                if prev_pred is not None:
+                    loss_s = loss_s + 0.005 * smoothness_loss(pred, prev_pred, mask_dev)
+                prev_pred = pred.detach()
 
-                loss_data_total += loss_data
+                # Physics losses — computed in float32 inside each fn
+                phys_val   = fd_physics_loss(pred, mask_dev)
+                bc_val     = bc_loss(pred, wall_mask_dev)
+                pres_stab  = pressure_stability_loss(pred, mask_dev)
 
+                if not torch.isnan(phys_val):
+                    loss_s     = loss_s + lambda_phys * phys_val
+                    epoch_phys += phys_val.item()
+                if not torch.isnan(bc_val):
+                    loss_s     = loss_s + lambda_bc * bc_val
+                    epoch_bc   += bc_val.item()
+                loss_s = loss_s + LAMBDA_PRES_STAB * pres_stab
+
+                total_loss = total_loss + loss_s
+
+                # FIX: correct time channel in next input
                 if s < dataset.rollout_steps - 1:
-                    next_field = pred.detach()
-                    current_data = torch.cat([
-                        next_field,
-                        mask_dev.expand(inp.shape[0], -1, -1, -1, -1),
-                        grid_coords.unsqueeze(0).expand(inp.shape[0], -1, -1, -1, -1).to(device)
-                    ], dim=1)
+                    current = make_next_input(
+                        pred.detach(), s + 1, T, batch_size
+                    )
 
-        current_lr = optimizer_data.param_groups[0]["lr"]
-        clip_val = 0.3 if current_lr > 1e-4 else 1.0   # tighter clip at high LR
-
-        loss_data_total.backward(retain_graph=True)
-        grad_norm_data = get_grad_norm(model)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_val)
-        optimizer_data.step()
-
-        optimizer_phys.zero_grad()
-        loss_phys_only = 0.0
-        current_phys = inp
-
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            for s in range(dataset.rollout_steps):
-                pred_phys = model(current_phys)
-
-                loss_phys_val = fd_physics_loss(pred_phys, mask_dev)
-                loss_bc_val = bc_loss(pred_phys, wall_mask_dev)
-                loss_pres_stab = pressure_stability_loss(pred_phys, mask_dev)
-
-                if torch.isnan(loss_phys_val):
-                    loss_phys_val = torch.tensor(0.0, device=device)
-                if torch.isnan(loss_bc_val):
-                    loss_bc_val = torch.tensor(0.0, device=device)
-
-                loss_phys_only = (
-                    loss_phys_only
-                    + lambda_phys * loss_phys_val
-                    + lambda_bc * loss_bc_val
-                    + 0.05 * loss_pres_stab
-                )
-                epoch_phys += loss_phys_val.item()
-                epoch_bc += loss_bc_val.item()
-
-                if s < dataset.rollout_steps - 1:
-                    next_field_phys = pred_phys.detach()
-                    current_phys = torch.cat([
-                        next_field_phys,
-                        mask_dev.expand(inp.shape[0], -1, -1, -1, -1),
-                        grid_coords.unsqueeze(0).expand(inp.shape[0], -1, -1, -1, -1).to(device)
-                    ], dim=1)
-
-        loss_phys_only.backward()
-        grad_norm_phys = get_grad_norm(model)
+        # Single backward pass — no retain_graph
+        total_loss.backward()
+        grad_norm_v = get_grad_norm(model)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer_phys.step()
+        optimizer.step()
 
-        epoch_loss += (loss_data_total + loss_phys_only).item()
+        epoch_loss += total_loss.item()
 
     scheduler.step()
-    avg_loss = epoch_loss / len(train_loader)
-    epoch_phys_avg = epoch_phys / len(train_loader)
 
-    # ── Periodic evaluation ──────────────────────────────────────────────
+    avg_loss       = epoch_loss  / len(train_loader)
+    avg_phys       = epoch_phys  / len(train_loader)
+    avg_mse        = epoch_mse   / len(train_loader)
+
+    # ── Periodic logging ─────────────────────────────────────────────────
     if epoch % 10 == 0 and epoch % 100 != 0:
-        lr_now = optimizer_data.param_groups[0]["lr"]
-        phys_avg = epoch_phys / max(1, len(train_loader))
-        print(f"  Epoch {epoch} | loss {epoch_loss/len(train_loader):.4f} | phys {phys_avg:.4f} | lp {lambda_phys:.3f} | LR {lr_now:.1e}")
+        lr_now = optimizer.param_groups[0]["lr"]
+        print(f"  Epoch {epoch} | loss {avg_loss:.4f} | mse {avg_mse:.4f} | "
+              f"phys {avg_phys:.5f} | lp {lambda_phys:.4f} | LR {lr_now:.2e}")
 
     if epoch % 100 == 0:
         model.eval()
         dataset.training_mode = False
         elapsed = time.time() - t_epoch
 
+        # Validation loss
         val_loss = 0.0
         with torch.no_grad():
             for inp_v, tgt_v in val_loader:
                 inp_v, tgt_v = inp_v.to(device), tgt_v.to(device)
-                pred_v = model(inp_v)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    pred_v = model(inp_v)
                 val_loss += masked_mse(pred_v, tgt_v[:, 0]).item()
         val_loss /= max(1, len(val_loader))
-        print(f"  Val loss: {val_loss:.6f}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -464,77 +432,68 @@ for epoch in range(start_epoch, EPOCHS):
                 "model_state_dict": model.state_dict(),
                 "stats": stats, "mask": mask, "grid_coords": grid_coords,
             }, BEST_MODEL_PATH)
-            print(f"  New best model saved (val={val_loss:.5f})")
+            print(f"  ✓ New best model saved (val={val_loss:.5f})")
 
-        # A. One-step accuracy (all pairs)
+        # One-step accuracy
         total_rel = 0.0
         with torch.no_grad():
             for i in range(T - 1):
-                inp_i = build_input(fields[i]).to(device)
-                tgt_i = fields[i + 1].unsqueeze(0).to(device)
-                pred_i = model(inp_i)
+                inp_i  = build_input(fields[i]).to(device)
+                tgt_i  = fields[i + 1].unsqueeze(0).to(device)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    pred_i = model(inp_i)
                 total_rel += masked_rel_l2(pred_i, tgt_i).item()
-        avg_rel = total_rel / (T - 1)
-        acc_1step = (1.0 - avg_rel) * 100.0
+        acc_1step = (1.0 - total_rel / (T - 1)) * 100.0
 
-        # B. Autoregressive rollout (from t=0)
+        # Autoregressive rollout
         rollout_steps = min(10, T - 1)
-        current = fields[0].unsqueeze(0).to(device)
+        current_r = fields[0].unsqueeze(0).to(device)
         with torch.no_grad():
             for s in range(rollout_steps):
-                inp_s = torch.cat(
-                    [current[0], mask.unsqueeze(0).to(device),
-                     grid_coords.to(device)], dim=0,
-                ).unsqueeze(0)
-                current = model(inp_s)
-        tgt_roll = fields[rollout_steps].unsqueeze(0).to(device)
-        rollout_acc = (1.0 - masked_rel_l2(current, tgt_roll).item()) * 100.0
+                inp_s = torch.cat([
+                    current_r[0], mask.unsqueeze(0).to(device),
+                    grid_coords.to(device)
+                ], dim=0).unsqueeze(0)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    current_r = model(inp_s)
+                # FIX: correct time channel
+                current_r[:, 4:5] = float(s + 1) / max(1, T - 1)
+        tgt_roll  = fields[rollout_steps].unsqueeze(0).to(device)
+        rollout_acc = (1.0 - masked_rel_l2(current_r, tgt_roll).item()) * 100.0
 
-        lr_now = optimizer_data.param_groups[0]["lr"]
+        lr_now = optimizer.param_groups[0]["lr"]
         print(
-            f"Epoch {epoch:4d} | "
-            f"MSE {epoch_mse/len(train_loader):.5f} | "
-            f"Phys {epoch_phys/len(train_loader):.5f} | "
+            f"Epoch {epoch:5d} | "
+            f"MSE {avg_mse:.5f} | "
+            f"Phys {avg_phys:.5f} | "
             f"BC {epoch_bc/len(train_loader):.5f} | "
             f"1-step {acc_1step:.1f}% | "
             f"Rollout-{rollout_steps} {rollout_acc:.1f}% | "
             f"Val {val_loss:.5f} | "
-            f"lp {lambda_phys:.3f} | "
-            f"LR {optimizer_data.param_groups[0]['lr']:.1e} | "
+            f"lp {lambda_phys:.4f} | "
+            f"LR {lr_now:.2e} | "
             f"{elapsed:.0f}s"
         )
-        print(f"  Grad norm after data loss: {grad_norm_data:.4f} | after phys loss: {grad_norm_phys:.4f}")
+        print(f"  Grad norm: {grad_norm_v:.4f}")
 
-        # Save checkpoint
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer_data.state_dict(),
-                "optimizer_data_state_dict": optimizer_data.state_dict(),
-                "optimizer_phys_state_dict": optimizer_phys.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "loss": avg_loss,
-                "stats": stats,
-                "mask": mask,
-                "grid_coords": grid_coords,
-            },
-            CHECKPOINT_PATH,
-        )
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "loss": avg_loss,
+            "stats": stats, "mask": mask, "grid_coords": grid_coords,
+        }, CHECKPOINT_PATH)
         t_epoch = time.time()
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  7. SAVE FINAL MODEL
 # ═══════════════════════════════════════════════════════════════════════════
 total_mins = (time.time() - t_start) / 60
 print(f"\nTraining complete in {total_mins:.2f} min.")
-torch.save(
-    {
-        "model_state_dict": model.state_dict(),
-        "stats": stats,
-        "mask": mask,
-        "grid_coords": grid_coords,
-    },
-    SAVE_PATH,
-)
+torch.save({
+    "model_state_dict": model.state_dict(),
+    "stats": stats, "mask": mask, "grid_coords": grid_coords,
+}, SAVE_PATH)
 print(f"Model saved to {SAVE_PATH}")

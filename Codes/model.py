@@ -75,7 +75,7 @@ class SpectralConv3d(nn.Module):
         out_ft[:, :, -m1:, -m2:, :m3] = self._cmul(x_ft[:, :, -m1:, -m2:, :m3], self.w4)
 
         result = torch.fft.irfftn(out_ft, s=(sx, sy, sz))
-        return result.to(orig_dtype)  # cast back to bfloat16 for the rest of the network
+        return result  # keep float32; autocast handles mixed precision boundaries
 
 
 # ---------------------------------------------------------------------------
