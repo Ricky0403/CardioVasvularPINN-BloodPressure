@@ -219,7 +219,7 @@ NUM_LAYERS = 4       # HUFNO layers (each has SpectralConv + MiniUNet)
 
 BATCH_SIZE    = 1
 ROLLOUT_STEPS = 8
-EPOCHS        = 22000
+EPOCHS        = 10000
 
 # Data optimizer: learns coarse global flow patterns, moderate LR
 LR_DATA      = 1e-4    # higher start — CosineWarmRestarts will drive it down
