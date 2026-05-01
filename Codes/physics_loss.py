@@ -148,10 +148,11 @@ def fd_momentum_loss(pred, prev_field, mask_dev, stats, dt=1.0, dx=1.0, viscosit
 
 
 def fd_physics_loss(pred, prev_field, mask_dev, stats, dt=1.0, dx=1.0, viscosity=0.035):
-    """Combined: 10 × continuity + momentum."""
+    """Combined: continuity + momentum, both normalized to O(1)."""
     loss_cont = fd_continuity_loss(pred, mask_dev, dx)
     loss_mom  = fd_momentum_loss(pred, prev_field, mask_dev, stats, dt, dx, viscosity)
-    return 10.0 * loss_cont + loss_mom
+    # Equal weighting — both are already normalized, continuity×10 was too aggressive
+    return loss_cont + loss_mom
 
 
 def bc_loss(pred, wall_mask_dev):

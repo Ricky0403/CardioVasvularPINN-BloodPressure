@@ -37,17 +37,19 @@ GROUPS     = 8         # GroupNorm groups
 BATCH_SIZE = 1
 ROLLOUT_STEPS = 8
 EPOCHS = 22000
-LR = 3e-4              # U-ResNet benefits from higher initial LR than FNO
+LR = 1e-3    # AdamW with cosine decay handles this well for U-Net architectures
 LR_STEP    = 100
 LR_GAMMA   = 0.5
 WEIGHT_DECAY = 1e-4
 NOISE_STD  = 0.01
 
 # Physics loss ramp-up schedule
-PHYS_RAMP_START = 0
-PHYS_RAMP_END   = 300
-LAMBDA_PHYS_MAX = 0.10   # can be higher now that momentum loss is normalized to O(1)
-LAMBDA_BC_MAX   = 1.0    # was 0.02 — way too low, BC was never being enforced
+PHYS_RAMP_START = 200    # pure data learning first
+PHYS_RAMP_END   = 1000   # slow ramp over 800 epochs
+LAMBDA_PHYS_MAX = 0.01   # physics is a regularizer, not the primary objective
+LAMBDA_BC_MAX   = 0.01   # BC same — gentle nudge only
+EARLY_STOP_PATIENCE = 800    # stop if val loss doesn't improve for this many epochs
+PRES_SMOOTH_WEIGHT  = 0.001  # was 0.01 — too strong, fighting data loss
 
 # Blood viscosity (kinematic, cm²/s — adjust to match your data units)
 VISCOSITY = 0.035
@@ -143,7 +145,7 @@ model = UResNet3d(
     out_channels=out_ch,
     base_width=BASE_WIDTH,
     groups=GROUPS,
-    use_checkpoint=False,
+    use_checkpoint=True,   # needed for 8-step rollout on 4GB,
 ).to(device)
 
 n_params = sum(p.numel() for p in model.parameters())
@@ -165,7 +167,7 @@ if os.path.exists(CHECKPOINT_PATH):
     model.load_state_dict(ckpt["model_state_dict"])
     # Only load model weights — optimizer is new (single instead of dual),
     # so we intentionally skip loading optimizer state.
-    start_epoch = 0  # reset epoch counter since training dynamics changed
+    start_epoch = ckpt.get("epoch", 0) + 1
 
     resume_lr = 1e-4  # warm-restart LR — lower than initial but not too low
     for pg in optimizer.param_groups:
@@ -231,7 +233,8 @@ t_epoch = t_start
 grid_coords_dev = grid_coords.unsqueeze(0).to(device)
 mask_inp_dev = mask_dev.to(device)
 best_val_loss = float('inf')
-step_weights = [1.0, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.5]
+epochs_without_improvement = 0
+step_weights = [1.0, 1.0, 1.0, 1.1, 1.1, 1.2, 1.2, 1.3]
 
 for epoch in range(start_epoch, EPOCHS):
     model.train()
@@ -291,7 +294,7 @@ for epoch in range(start_epoch, EPOCHS):
                 epoch_bc += loss_bc_val.item()
 
                 # --- Pressure smoothness ---
-                loss_step = loss_step + 0.01 * pressure_stability_loss(pred, mask_dev)
+                loss_step = loss_step + PRES_SMOOTH_WEIGHT * pressure_stability_loss(pred, mask_dev)
 
                 loss_total += loss_step
 
@@ -307,7 +310,7 @@ for epoch in range(start_epoch, EPOCHS):
 
         loss_total.backward()
         epoch_grad_norm = get_grad_norm(model)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
 
         epoch_loss += loss_total.item()
@@ -339,12 +342,18 @@ for epoch in range(start_epoch, EPOCHS):
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_without_improvement = 0
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "stats": stats, "mask": mask, "grid_coords": grid_coords,
             }, BEST_MODEL_PATH)
             print(f"  New best model saved (val={val_loss:.5f})")
+        else:
+            epochs_without_improvement += 100
+            if epochs_without_improvement >= EARLY_STOP_PATIENCE:
+                print(f"Early stopping at epoch {epoch} — no improvement for {EARLY_STOP_PATIENCE} epochs")
+                break
 
         # One-step accuracy
         total_rel = 0.0

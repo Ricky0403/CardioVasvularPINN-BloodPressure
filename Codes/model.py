@@ -150,6 +150,7 @@ class UResNet3d(nn.Module):
         self.bottleneck = nn.Sequential(
             ResBlock3d(w * 8, groups=groups),
             ResBlock3d(w * 8, groups=groups),
+            ResBlock3d(w * 8, groups=groups),   # extra block for richer global features
         )
 
         # --- Decoder ---
