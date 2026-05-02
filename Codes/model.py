@@ -122,6 +122,13 @@ class FNO3d(nn.Module):
         self.proj1 = nn.Linear(width, 128)
         self.proj2 = nn.Linear(128, out_channels)
 
+    def reset_output_head(self):
+        """Helper to reinitialize pointwise projection layers for curriculum learning."""
+        nn.init.xavier_uniform_(self.proj1.weight)
+        nn.init.zeros_(self.proj1.bias)
+        nn.init.xavier_uniform_(self.proj2.weight)
+        nn.init.zeros_(self.proj2.bias)
+
     def forward(self, x):
         """
         x : (B, C_in, X, Y, Z)
