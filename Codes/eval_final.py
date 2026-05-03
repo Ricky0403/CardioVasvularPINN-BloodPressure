@@ -28,10 +28,19 @@ model = UResNet3d(
     out_channels=5,
     base_width=32,
     groups=8,
-    use_checkpoint=False,  # no need for checkpointing during eval
+    use_checkpoint=False,
 ).to(device)
+
+# ── Fix legacy state dict: conv2.0.* → conv2.* ──
+old_sd = ckpt["model_state_dict"]
+new_sd = {}
+for k, v in old_sd.items():
+    new_k = k.replace(".conv2.0.", ".conv2.")
+    new_sd[new_k] = v
+ckpt["model_state_dict"] = new_sd
+
 model.load_state_dict(ckpt["model_state_dict"])
-model.eval()
+model.eval()   # Dropout3d is automatically inactive during eval()
 
 mask_dev = mask.unsqueeze(0).unsqueeze(0).to(device)
 

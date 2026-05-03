@@ -41,14 +41,14 @@ LR = 1e-3    # AdamW with cosine decay handles this well for U-Net architectures
 LR_STEP    = 100
 LR_GAMMA   = 0.5
 WEIGHT_DECAY = 1e-4
-NOISE_STD  = 0.01
+NOISE_STD  = 0.05
 
 # Physics loss ramp-up schedule
-PHYS_RAMP_START = 200    # pure data learning first
-PHYS_RAMP_END   = 1000   # slow ramp over 800 epochs
-LAMBDA_PHYS_MAX = 0.01   # physics is a regularizer, not the primary objective
-LAMBDA_BC_MAX   = 0.01   # BC same — gentle nudge only
-EARLY_STOP_PATIENCE = 800    # stop if val loss doesn't improve for this many epochs
+PHYS_RAMP_START = 0       # no ramp — apply from first epoch on resume
+PHYS_RAMP_END   = 1       # ramp completes instantly
+LAMBDA_PHYS_MAX = 0.05    # 5x increase — physics must compete with data loss
+LAMBDA_BC_MAX   = 0.02
+EARLY_STOP_PATIENCE = 1500   # must span at least 3 cosine restart cycles
 PRES_SMOOTH_WEIGHT  = 0.001  # was 0.01 — too strong, fighting data loss
 
 # Blood viscosity (kinematic, cm²/s — adjust to match your data units)
@@ -81,7 +81,11 @@ mask        = mask.cpu()
 grid_coords = grid_coords.cpu()
 
 T = fields.shape[0]
-val_split = int(0.8 * T)
+# Val needs at least ROLLOUT_STEPS + 1 timesteps to form even one pair
+min_val_timesteps = ROLLOUT_STEPS + 1          # minimum to make 1 val pair
+val_split = T - min_val_timesteps              # give val exactly the minimum needed
+val_split = max(val_split, ROLLOUT_STEPS + 1)  # safety: train also needs enough
+print(f"Train timesteps: {val_split}, Val timesteps: {T - val_split}")
 train_fields = fields[:val_split]
 val_fields   = fields[val_split:]
 print(f"Total timesteps: {T}, training pairs: {val_split - ROLLOUT_STEPS}")
@@ -106,10 +110,19 @@ class TimeStepDataset(Dataset):
     def __getitem__(self, idx):
         field_in = self.fields[idx]
         if self.training_mode:
+            field_in = field_in.clone()
+            # 1. Gaussian noise
             if self.noise_std > 0:
                 noise = self.noise_std * torch.randn_like(field_in[:4])
-                field_in = field_in.clone()
                 field_in[:4] = field_in[:4] + noise * self.mask_ch
+            # 2. Random velocity scaling (simulates different flow rates)
+            if torch.rand(1).item() < 0.5:
+                scale = 0.85 + 0.30 * torch.rand(1).item()  # 0.85 to 1.15
+                field_in[:3] = field_in[:3] * scale          # scale velocity only
+            # 3. Random pressure offset
+            if torch.rand(1).item() < 0.4:
+                offset = (torch.rand(1).item() - 0.5) * 0.2
+                field_in[3:4] = field_in[3:4] + offset
 
             # NOTE: temporal reversal (flipping velocity signs) was removed because
             # it creates nonphysical samples — reversing velocity without also reversing
@@ -164,21 +177,32 @@ start_epoch = 0
 if os.path.exists(CHECKPOINT_PATH):
     print(f"Loading checkpoint: {CHECKPOINT_PATH}")
     ckpt = torch.load(CHECKPOINT_PATH, weights_only=False)
+
+    # ── Fix legacy state dict: conv2.0.* → conv2.* ──
+    old_sd = ckpt["model_state_dict"]
+    new_sd = {}
+    for k, v in old_sd.items():
+        new_k = k.replace(".conv2.0.", ".conv2.")
+        new_sd[new_k] = v
+    ckpt["model_state_dict"] = new_sd
+
     model.load_state_dict(ckpt["model_state_dict"])
-    # Only load model weights — optimizer is new (single instead of dual),
-    # so we intentionally skip loading optimizer state.
+    
     start_epoch = ckpt.get("epoch", 0) + 1
 
-    resume_lr = 1e-4  # warm-restart LR — lower than initial but not too low
+    resume_lr = 5e-4       # was 1e-4 — need a real warm restart to escape plateau
     for pg in optimizer.param_groups:
         pg["lr"] = resume_lr
         pg["initial_lr"] = resume_lr
 
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=3000, eta_min=1e-7,
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=500,           # restart every 500 epochs
+        T_mult=1,          # keep period constant
+        eta_min=1e-6,
     )
     dataset, train_loader, val_dataset, val_loader = build_loaders(ROLLOUT_STEPS)
-    print(f"Warm-restarting with model weights from checkpoint, LR={resume_lr}")
+    print(f"Resuming from epoch {start_epoch}, LR reset to {resume_lr}")
 else:
     dataset, train_loader, val_dataset, val_loader = build_loaders(ROLLOUT_STEPS)
     print("No checkpoint found — starting fresh.")
@@ -196,8 +220,17 @@ print(f"Wall voxels: {wall_mask_dev.sum().item()}")
 
 
 def masked_mse(pred, target):
+    """MSE loss weighted by local velocity magnitude — core flow matters more."""
     sq = (pred - target) ** 2 * mask_dev
-    return sq.sum() / (mask_dev.sum() * pred.shape[1])
+
+    # Weight by velocity magnitude of target (encourages accuracy where flow is fastest)
+    vel_mag = (target[:, :3] ** 2).sum(dim=1, keepdim=True).sqrt()
+    vel_weight = (0.5 + vel_mag / (vel_mag.max() + 1e-8)) * mask_dev  # weight in [0.5, 1.5]
+
+    # Apply velocity weighting to velocity channels, uniform to pressure
+    weighted = sq.clone()
+    weighted[:, :3] = weighted[:, :3] * vel_weight
+    return weighted.sum() / (mask_dev.sum() * pred.shape[1] + 1e-8)
 
 
 @torch.no_grad()
@@ -234,7 +267,8 @@ grid_coords_dev = grid_coords.unsqueeze(0).to(device)
 mask_inp_dev = mask_dev.to(device)
 best_val_loss = float('inf')
 epochs_without_improvement = 0
-step_weights = [1.0, 1.0, 1.0, 1.1, 1.1, 1.2, 1.2, 1.3]
+step_weights = [1.3, 1.2, 1.1, 1.0, 1.0, 1.0, 1.0, 1.0]
+# Front-weight: step 1 accuracy is what matters for 95% target
 
 for epoch in range(start_epoch, EPOCHS):
     model.train()
@@ -332,12 +366,16 @@ for epoch in range(start_epoch, EPOCHS):
         elapsed = time.time() - t_epoch
 
         val_loss = 0.0
+        n_val_batches = 0
         with torch.no_grad():
             for inp_v, tgt_v in val_loader:
+                if inp_v is None:
+                    continue
                 inp_v, tgt_v = inp_v.to(device), tgt_v.to(device)
                 pred_v = model(inp_v)
                 val_loss += masked_mse(pred_v, tgt_v[:, 0]).item()
-        val_loss /= max(1, len(val_loader))
+                n_val_batches += 1
+        val_loss = val_loss / max(1, n_val_batches)
         print(f"  Val loss: {val_loss:.6f}")
 
         if val_loss < best_val_loss:
@@ -366,18 +404,25 @@ for epoch in range(start_epoch, EPOCHS):
         avg_rel = total_rel / (T - 1)
         acc_1step = (1.0 - avg_rel) * 100.0
 
-        # Autoregressive rollout
+        # Autoregressive rollout — model feeds its own output, no ground truth
         rollout_steps = min(10, T - 1)
-        current = fields[0].unsqueeze(0).to(device)
+        current_field = fields[0].unsqueeze(0).to(device)
+        rollout_errors = []
         with torch.no_grad():
             for s in range(rollout_steps):
-                inp_s = torch.cat(
-                    [current[0], mask.unsqueeze(0).to(device),
-                     grid_coords.to(device)], dim=0,
-                ).unsqueeze(0)
-                current = model(inp_s)
-        tgt_roll = fields[rollout_steps].unsqueeze(0).to(device)
-        rollout_acc = (1.0 - masked_rel_l2(current, tgt_roll).item()) * 100.0
+                inp_s = torch.cat([
+                    current_field[0],
+                    mask.unsqueeze(0).to(device),
+                    grid_coords.to(device)
+                ], dim=0).unsqueeze(0)
+                current_field = model(inp_s)
+                current_field = current_field * mask_dev  # enforce vessel mask
+                tgt_s = fields[s + 1].unsqueeze(0).to(device)
+                err_s = masked_rel_l2(current_field, tgt_s).item()
+                rollout_errors.append(err_s)
+        rollout_acc = (1.0 - rollout_errors[-1]) * 100.0
+        avg_rollout_err = sum(rollout_errors) / len(rollout_errors)
+        print(f"  Rollout errors per step: {[f'{e:.3f}' for e in rollout_errors]}")
 
         lr_now = optimizer.param_groups[0]["lr"]
         print(

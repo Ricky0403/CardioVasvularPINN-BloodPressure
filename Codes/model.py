@@ -25,20 +25,19 @@ from torch.utils.checkpoint import checkpoint
 # ---------------------------------------------------------------------------
 class ResBlock3d(nn.Module):
     """
-    Pre-activation residual block:
-        x → GN → GELU → Conv3d → GN → GELU → Conv3d → + x
-
-    If in_channels != out_channels, a 1x1 projection is used on the skip path.
+    Pre-activation residual block with optional dropout:
+        x → GN → GELU → Conv3d → GN → GELU → Conv3d → Dropout3d → + x
     """
 
-    def __init__(self, in_channels, out_channels=None, groups=8):
+    def __init__(self, in_channels, out_channels=None, groups=8, dropout=0.05):
         super().__init__()
         out_channels = out_channels or in_channels
 
-        self.gn1 = nn.GroupNorm(min(groups, in_channels), in_channels)
+        self.gn1   = nn.GroupNorm(min(groups, in_channels), in_channels)
         self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.gn2 = nn.GroupNorm(min(groups, out_channels), out_channels)
+        self.gn2   = nn.GroupNorm(min(groups, out_channels), out_channels)
         self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.drop  = nn.Dropout3d(p=dropout)
 
         # Skip projection if channel count changes
         self.skip = (
@@ -53,6 +52,7 @@ class ResBlock3d(nn.Module):
         out = self.conv1(out)
         out = F.gelu(self.gn2(out))
         out = self.conv2(out)
+        out = self.drop(out)
         return out + residual
 
 
