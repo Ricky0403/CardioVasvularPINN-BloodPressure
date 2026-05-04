@@ -41,7 +41,7 @@ LR = 1e-3    # AdamW with cosine decay handles this well for U-Net architectures
 LR_STEP    = 100
 LR_GAMMA   = 0.5
 WEIGHT_DECAY = 1e-4
-NOISE_STD  = 0.05
+NOISE_STD  = 0.02    # reduced — rollout is stable, now optimise step 1 precision
 
 # Physics loss ramp-up schedule
 PHYS_RAMP_START = 0       # no ramp — apply from first epoch on resume
@@ -115,13 +115,14 @@ class TimeStepDataset(Dataset):
             if self.noise_std > 0:
                 noise = self.noise_std * torch.randn_like(field_in[:4])
                 field_in[:4] = field_in[:4] + noise * self.mask_ch
-            # 2. Random velocity scaling (simulates different flow rates)
-            if torch.rand(1).item() < 0.5:
-                scale = 0.85 + 0.30 * torch.rand(1).item()  # 0.85 to 1.15
-                field_in[:3] = field_in[:3] * scale          # scale velocity only
-            # 3. Random pressure offset
-            if torch.rand(1).item() < 0.4:
-                offset = (torch.rand(1).item() - 0.5) * 0.2
+            # 2. Random velocity scaling — reduced range now that rollout is stable
+            if torch.rand(1).item() < 0.3:
+                scale = 0.93 + 0.14 * torch.rand(1).item()  # 0.93 to 1.07
+                field_in[:3] = field_in[:3] * scale
+
+            # 3. Random pressure offset — reduced
+            if torch.rand(1).item() < 0.2:
+                offset = (torch.rand(1).item() - 0.5) * 0.1
                 field_in[3:4] = field_in[3:4] + offset
 
             # NOTE: temporal reversal (flipping velocity signs) was removed because
@@ -266,8 +267,8 @@ t_epoch = t_start
 grid_coords_dev = grid_coords.unsqueeze(0).to(device)
 mask_inp_dev = mask_dev.to(device)
 best_val_loss = float('inf')
-epochs_without_improvement = 0
-step_weights = [1.3, 1.2, 1.1, 1.0, 1.0, 1.0, 1.0, 1.0]
+step_weights = [2.5, 2.0, 1.5, 1.2, 1.0, 1.0, 1.0, 1.0]
+# Step 1 now has 2.5x weight — directly targets 95% 1-step accuracy
 # Front-weight: step 1 accuracy is what matters for 95% target
 
 for epoch in range(start_epoch, EPOCHS):
