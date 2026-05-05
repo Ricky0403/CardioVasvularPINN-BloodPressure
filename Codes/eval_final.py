@@ -48,9 +48,9 @@ RESULTS_DIR  = "../Results"
 PLOT_DIR     = os.path.join(RESULTS_DIR, "plots")
 os.makedirs(PLOT_DIR, exist_ok=True)
 
-CHECKPOINT_HUFNO = "../Models/fno_best.pth"
+CHECKPOINT_HUFNO = "../Models/hfno_best.pth"
 if not os.path.exists(CHECKPOINT_HUFNO):
-    CHECKPOINT_HUFNO = "../Models/fno_checkpoint.pth"
+    CHECKPOINT_HUFNO = "../Models/hfno_checkpoint.pth"
 
 # Optional: if you trained these baselines, point to their checkpoints.
 # Set to None to skip that row in the ablation table.

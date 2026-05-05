@@ -249,9 +249,9 @@ DATA_PATH  = "../VelocityData3D"
 WALL_PATH  = "../VelocityData3D/WallMesh/wall.vtp"
 SAVE_DIR   = "../Models"
 
-CHECKPOINT_PATH = os.path.join(SAVE_DIR, "fno_checkpoint.pth")
-SAVE_PATH       = os.path.join(SAVE_DIR, "fno_model.pth")
-BEST_MODEL_PATH = os.path.join(SAVE_DIR, "fno_best.pth")
+CHECKPOINT_PATH = os.path.join(SAVE_DIR, "hfno_checkpoint.pth")
+SAVE_PATH       = os.path.join(SAVE_DIR, "hfno_model.pth")
+BEST_MODEL_PATH = os.path.join(SAVE_DIR, "hfno_best.pth")
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
