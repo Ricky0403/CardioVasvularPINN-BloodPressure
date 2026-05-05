@@ -15,7 +15,7 @@ FALLBACK_MODEL_PATH = "../Models/uresnet_checkpoint.pth"
 # ── Ensure a Results directory exists for the CSV ──
 RESULTS_DIR = "../Results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
-CSV_OUTPUT_PATH = os.path.join(RESULTS_DIR, "rollout_metrics.csv")
+CSV_OUTPUT_PATH = os.path.join(RESULTS_DIR, "res-net_eval_final_metrics.csv")
 
 if os.path.exists(BEST_MODEL_PATH):
     MODEL_PATH = BEST_MODEL_PATH

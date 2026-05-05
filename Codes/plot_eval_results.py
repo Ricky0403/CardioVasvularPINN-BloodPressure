@@ -316,9 +316,9 @@ def main():
     df = load_csv(csv_path)
     print(f"  {len(df)} rows, columns: {list(df.columns)}")
 
-    g1 = os.path.join(out_dir, "graph1_predictive_error.png")
-    g2 = os.path.join(out_dir, "graph2_physics_compliance.png")
-    tb = os.path.join(out_dir, "table_defense_summary.png")
+    g1 = os.path.join(out_dir, "res-net_graph1_predictive_error.png")
+    g2 = os.path.join(out_dir, "res-net_graph2_physics_compliance.png")
+    tb = os.path.join(out_dir, "res-net_table_defense_summary.png")
 
     plot_graph1(df, g1)
     plot_graph2(df, g2)
