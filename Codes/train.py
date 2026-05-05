@@ -212,41 +212,47 @@ print(f"FNO3d — {n_params:,} parameters")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  4. CHECKPOINT — partial load, reset output head
+#  4. CHECKPOINT — Smart Load (Resume vs. Restart)
 # ═══════════════════════════════════════════════════════════════════════════
 start_epoch   = 0
-phase_offset  = 0   # epoch within the current phase (for scheduler)
 
 if os.path.exists(CHECKPOINT_PATH):
     print(f"Loading checkpoint: {CHECKPOINT_PATH}")
-    ckpt   = torch.load(CHECKPOINT_PATH, weights_only=False, map_location=device)
-    old_sd = ckpt["model_state_dict"]
-    new_sd = model.state_dict()
+    ckpt = torch.load(CHECKPOINT_PATH, weights_only=False, map_location=device)
 
-    matched, skipped = {}, []
-    for k, v in old_sd.items():
-        if k in new_sd and new_sd[k].shape == v.shape:
-            matched[k] = v
-        else:
-            skipped.append(k)
-    new_sd.update(matched)
-    model.load_state_dict(new_sd)
-    print(f"  Loaded {len(matched)} tensors | skipped: {skipped}")
+    # SCENARIO A: Resuming an interrupted training run (Safe Resume)
+    if "phase" in ckpt:
+        model.load_state_dict(ckpt["model_state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        best_1step  = ckpt.get("best_1step", 0.0) # Recover the best accuracy score
+        print(f"  [✓] Resuming existing training from Epoch {start_epoch} (Phase {ckpt['phase']})")
 
-    # The proj weights will be reinitialized via the build-in model.reset_output_head()
-    # (If the helper isn't added, we do it inline here)
-    if hasattr(model, 'reset_output_head'):
-        model.reset_output_head()
-        print("  Re-initialized proj1 + proj2 for clean head recovery")
+    # SCENARIO B: Loading an old baseline to start Phase 1 from scratch (Transfer Learning)
     else:
-        torch.nn.init.xavier_uniform_(model.proj1.weight)
-        torch.nn.init.zeros_(model.proj1.bias)
-        torch.nn.init.xavier_uniform_(model.proj2.weight)
-        torch.nn.init.zeros_(model.proj2.bias)
-        print("  Re-initialized proj1 + proj2 (inline) for clean head recovery")
+        old_sd = ckpt["model_state_dict"]
+        new_sd = model.state_dict()
+        matched, skipped = {}, []
+        
+        for k, v in old_sd.items():
+            if k in new_sd and new_sd[k].shape == v.shape:
+                matched[k] = v
+            else:
+                skipped.append(k)
+        new_sd.update(matched)
+        model.load_state_dict(new_sd)
+        print(f"  Loaded {len(matched)} tensors | skipped: {skipped}")
 
-    start_epoch = 0   # RESET epoch counter — we're doing phased retraining
-    print(f"  Starting phased retraining from epoch 0")
+        # Wipe the output head for a fresh start
+        if hasattr(model, 'reset_output_head'):
+            model.reset_output_head()
+        else:
+            torch.nn.init.xavier_uniform_(model.proj1.weight)
+            torch.nn.init.zeros_(model.proj1.bias)
+            torch.nn.init.xavier_uniform_(model.proj2.weight)
+            torch.nn.init.zeros_(model.proj2.bias)
+
+        start_epoch = 0
+        print(f"  [!] Wiped output head. Starting phased retraining from Epoch 0")
 else:
     print("No checkpoint — starting fresh.")
 
