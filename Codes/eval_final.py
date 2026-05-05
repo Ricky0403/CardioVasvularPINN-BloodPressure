@@ -1,4 +1,5 @@
 import os
+import csv
 import torch
 from model import UResNet3d
 from fno_data_loader import FNODataLoader
@@ -10,6 +11,11 @@ DATA_PATH = "../VelocityData3D"
 WALL_PATH = "../VelocityData3D/WallMesh/wall.vtp"
 BEST_MODEL_PATH = "../Models/uresnet_best.pth"
 FALLBACK_MODEL_PATH = "../Models/uresnet_checkpoint.pth"
+
+# ── Ensure a Results directory exists for the CSV ──
+RESULTS_DIR = "../Results"
+os.makedirs(RESULTS_DIR, exist_ok=True)
+CSV_OUTPUT_PATH = os.path.join(RESULTS_DIR, "rollout_metrics.csv")
 
 if os.path.exists(BEST_MODEL_PATH):
     MODEL_PATH = BEST_MODEL_PATH
@@ -72,7 +78,8 @@ def pressure_drop(field):
 
 
 # Full autoregressive rollout
-print(f"\n{'Step':>5} | {'Rel L2':>8} | {'Acc':>8} | {'Vel err':>9} | {'Pres err':>9} | {'ΔP (pred)':>10} | {'ΔP (true)':>10} | {'ΔP err%':>8}")
+header_string = f"\n{'Step':>5} | {'Rel L2':>8} | {'Acc':>8} | {'Vel err':>9} | {'Pres err':>9} | {'ΔP (pred)':>10} | {'ΔP (true)':>10} | {'ΔP err%':>8}"
+print(header_string)
 print("-" * 88)
 
 current = fields[0].unsqueeze(0).to(device)
@@ -81,34 +88,54 @@ acc_list = []
 pres_list = []
 dp_list = []
 
-with torch.no_grad():
-    for s in range(len(fields) - 1):
-        inp = torch.cat([
-            current[0],
-            mask.unsqueeze(0),
-            grid_coords,
-        ], dim=0).unsqueeze(0)
-        current = model(inp)
-        tgt = fields[s + 1].unsqueeze(0).to(device)
+# ── Open CSV file and write header ──
+with open(CSV_OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as csv_file:
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(['Step', 'Rel L2', 'Acc', 'Vel err', 'Pres err', 'ΔP (pred)', 'ΔP (true)', 'ΔP err%'])
 
-        err      = masked_rel_l2(current, tgt).item()
-        vel_err  = masked_rel_l2(current[:, :3], tgt[:, :3]).item()
-        pres_err = masked_rel_l2(current[:, 3:4], tgt[:, 3:4]).item()
+    with torch.no_grad():
+        for s in range(len(fields) - 1):
+            inp = torch.cat([
+                current[0],
+                mask.unsqueeze(0),
+                grid_coords,
+            ], dim=0).unsqueeze(0)
+            current = model(inp)
+            tgt = fields[s + 1].unsqueeze(0).to(device)
 
-        dp_pred = pressure_drop(current)
-        dp_true = pressure_drop(tgt)
-        dp_err_pct = abs(dp_pred - dp_true) / (abs(dp_true) + 1e-8) * 100.0
+            err      = masked_rel_l2(current, tgt).item()
+            vel_err  = masked_rel_l2(current[:, :3], tgt[:, :3]).item()
+            pres_err = masked_rel_l2(current[:, 3:4], tgt[:, 3:4]).item()
 
-        max_err = max(max_err, err)
-        acc_list.append((1 - err) * 100)
-        pres_list.append(pres_err)
-        dp_list.append((dp_pred, dp_true, dp_err_pct))
+            dp_pred = pressure_drop(current)
+            dp_true = pressure_drop(tgt)
+            dp_err_pct = abs(dp_pred - dp_true) / (abs(dp_true) + 1e-8) * 100.0
 
-        print(
-            f"{s+1:>5} | {err:>8.4f} | {(1-err)*100:>7.1f}% | "
-            f"{vel_err:>9.4f} | {pres_err:>9.4f} | "
-            f"{dp_pred:>10.4f} | {dp_true:>10.4f} | {dp_err_pct:>7.1f}%"
-        )
+            max_err = max(max_err, err)
+            acc_list.append((1 - err) * 100)
+            pres_list.append(pres_err)
+            dp_list.append((dp_pred, dp_true, dp_err_pct))
+
+            # Terminal print
+            print(
+                f"{s+1:>5} | {err:>8.4f} | {(1-err)*100:>7.1f}% | "
+                f"{vel_err:>9.4f} | {pres_err:>9.4f} | "
+                f"{dp_pred:>10.4f} | {dp_true:>10.4f} | {dp_err_pct:>7.1f}%"
+            )
+            
+            # CSV row write
+            csv_writer.writerow([
+                s + 1,
+                f"{err:.4f}",
+                f"{(1-err)*100:.1f}%",
+                f"{vel_err:.4f}",
+                f"{pres_err:.4f}",
+                f"{dp_pred:.4f}",
+                f"{dp_true:.4f}",
+                f"{dp_err_pct:.1f}%"
+            ])
+
+print(f"\nCSV successfully saved to: {CSV_OUTPUT_PATH}")
 
 # ── Summary ──
 stable_steps = sum(1 for a in acc_list if a > 70.0)

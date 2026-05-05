@@ -62,6 +62,14 @@ def load_csv(path: str) -> pd.DataFrame:
         elif "dp" in lc and "true" in lc: rename[c] = "ΔP (true)"
         elif "dp" in lc and "err"  in lc: rename[c] = "ΔP err%"
     df.rename(columns=rename, inplace=True)
+    # Coerce every column except Step to float (handles stray spaces / % signs)
+    for col in ["Rel L2", "Acc", "Vel err", "Pres err", "ΔP (pred)", "ΔP (true)", "ΔP err%"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace("%", "").str.strip(),
+                errors="coerce"
+            )
+    df["Step"] = pd.to_numeric(df["Step"], errors="coerce").astype(int)
     return df
 
 
@@ -149,11 +157,12 @@ def plot_graph2(df: pd.DataFrame, out_path: str):
     fig, ax = plt.subplots(figsize=(11, 5.5), facecolor=BG)
     ax.set_facecolor(BG)
 
-    ax.semilogy(steps, ns_proxy, color=ORANGE, linewidth=2.2,
-                label="Discrete NS Residual (proxy)", zorder=3)
+    # ── Plain line plot on a log-scale y-axis ──
+    ax.plot(steps, ns_proxy, color=ORANGE, linewidth=2.2,
+            marker="o", markersize=4, markerfacecolor=ORANGE,
+            label="Discrete NS Residual (proxy)", zorder=3)
 
-    # Fill under curve for visual weight
-    ax.fill_between(steps, 1e-5, ns_proxy, alpha=0.15, color=ORANGE)
+    ax.set_yscale("log")
 
     # Mark the pressure-explosion step
     window   = (steps >= 20) & (steps <= 26)
@@ -161,23 +170,25 @@ def plot_graph2(df: pd.DataFrame, out_path: str):
     pk_step  = steps[window][pk_idx]
     pk_val   = ns_proxy[window][pk_idx]
 
-    ax.scatter([pk_step], [pk_val], s=120, color=RED, zorder=5, label=f"Peak (step {pk_step})")
+    ax.scatter([pk_step], [pk_val], s=140, color=RED, zorder=5,
+               label=f"Peak (step {pk_step})", marker="*")
     ax.annotate(
         f"Physics spike\n(step {pk_step})",
         xy=(pk_step, pk_val),
-        xytext=(pk_step + 4, pk_val * 3),
+        xytext=(pk_step + 5, pk_val * 4),
         fontsize=10, fontweight="bold", color=RED,
         arrowprops=dict(arrowstyle="->", color=RED, lw=1.6),
     )
 
-    # Threshold line
+    # Reference threshold line
     ax.axhline(0.01, color=GRAY, linewidth=1.0, linestyle=":", zorder=2)
     ax.text(51.2, 0.011, "Compliance\nthreshold", fontsize=8, color=GRAY, va="bottom")
 
     ax.set_xlim(0.5, 52)
     ax.set_xlabel("Rollout Step", fontsize=12)
     ax.set_ylabel("NS Residual (log scale)", fontsize=12)
-    ax.set_title("Graph 2 — Physical Compliance Curve (Discrete Navier-Stokes Residual)", fontsize=13, fontweight="bold", pad=12)
+    ax.set_title("Graph 2 — Physical Compliance Curve (Discrete Navier-Stokes Residual)",
+                 fontsize=13, fontweight="bold", pad=12)
     ax.legend(loc="upper left", framealpha=0.85, fontsize=9)
     ax.set_xticks(np.arange(0, 55, 5))
     ax.yaxis.set_major_formatter(matplotlib.ticker.LogFormatterSciNotation(base=10))
