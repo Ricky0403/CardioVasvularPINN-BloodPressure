@@ -87,11 +87,14 @@ BATCH_SIZE = 1
 EPOCHS     = 22000
 NOISE_STD  = 0.005   # reduced noise during recovery
 
+PRES_WEIGHT = 1.0   # Phase 1: equal weight
+# Will be set to 3.0 in Phase 2+ via get_phase logic below
+
 # ── Training phases ────────────────────────────────────────────────────────
 # Phase 1: head-only warmup — fix backbone, train proj1+proj2 aggressively
 PHASE1_END      = 500    # epochs of head-only training
 PHASE1_LR       = 5e-4   # high LR for fresh output head
-PHASE1_ROLLOUT  = 2      # short rollout — focus purely on 1-step quality
+PHASE1_ROLLOUT  = 1      # short rollout — focus purely on 1-step quality
 
 # Phase 2: full fine-tune, data-priority, weak physics
 PHASE2_END      = 3000
@@ -169,8 +172,6 @@ class TimeStepDataset(Dataset):
             if self.noise_std > 0:
                 noise = self.noise_std * torch.randn_like(field_in[:4])
                 field_in[:4] += noise * self.mask_ch
-            if torch.rand(1).item() < 0.2:   # reduced flip probability
-                field_in[:3] = -field_in[:3]
 
         inp     = torch.cat([field_in, self.mask_ch, self.coords], dim=0)
         targets = self.fields[idx + 1 : idx + 1 + self.rollout_steps, :4]
@@ -271,6 +272,7 @@ def get_phase(epoch):
 
 def setup_phase(phase, model, current_epoch):
     """Configure optimizer, scheduler, dataset for the given phase."""
+    global PRES_WEIGHT
     if phase == 1:
         print(f"\n{'='*60}")
         print(f"PHASE 1 — Head-only warmup (epochs 0–{PHASE1_END})")
@@ -315,6 +317,7 @@ def setup_phase(phase, model, current_epoch):
             phys=PHASE2_LAMBDA_PHYS, bc=PHASE2_LAMBDA_BC,
             pres=PHASE2_LAMBDA_PRES, smooth=0.003,
         )
+        PRES_WEIGHT = 3.0
         return optimizer, scheduler, ds, dl, vds, vdl, lambdas
 
     else:  # phase 3
@@ -336,6 +339,7 @@ def setup_phase(phase, model, current_epoch):
             phys=PHASE3_LAMBDA_PHYS, bc=PHASE3_LAMBDA_BC,
             pres=PHASE3_LAMBDA_PRES, smooth=0.005,
         )
+        PRES_WEIGHT = 3.0
         return optimizer, scheduler, ds, dl, vds, vdl, lambdas
 
 
@@ -354,8 +358,18 @@ grid_coords_dev = grid_coords.to(device)
 
 
 def masked_mse(pred, target):
+    """MSE weighted by local velocity magnitude — high-flow regions penalised more."""
     sq = (pred.float() - target.float()) ** 2 * mask_dev.float()
-    return sq.sum() / (mask_dev.sum() * 4)
+
+    # Weight velocity channels by local speed
+    vel_mag   = (target[:, :3].float() ** 2).sum(dim=1, keepdim=True).sqrt()
+    vel_weight = (0.5 + vel_mag / (vel_mag.max() + 1e-8)) * mask_dev.float()
+
+    weighted = sq.clone()
+    weighted[:, :3] = weighted[:, :3] * vel_weight   # speed-weighted velocity loss
+    weighted[:, 3:4] = weighted[:, 3:4] * PRES_WEIGHT  # see Change 11 below
+
+    return weighted.sum() / (mask_dev.sum() * pred.shape[1] + 1e-8)
 
 
 @torch.no_grad()
@@ -444,7 +458,8 @@ for epoch in range(start_epoch, EPOCHS):
 
                 # Data loss — pure MSE, no step weighting in phase 1
                 mse_s  = masked_mse(pred, tgt_s)
-                loss_s = mse_s
+                step_w = 2.0 if s == 0 else 1.0   # front-weight step 1
+                loss_s = mse_s * step_w
                 epoch_mse += mse_s.item()
 
                 # Smoothness
